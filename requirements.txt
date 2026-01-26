@@ -1,0 +1,16 @@
+huggingface-hub==0.36.0
+matplotlib==3.7.5
+numpy==1.24.4
+openai==2.2.0
+opencv-contrib-python==4.13.0.90
+opencv-python==4.13.0.90
+pillow==10.4.0
+safetensors==0.5.3
+scikit-image==0.21.0
+scipy==1.10.1
+tokenizers==0.20.3
+torch==2.4.1
+torchaudio==2.4.1
+torchvision==0.19.1
+tqdm==4.67.1
+transformers==4.46.3

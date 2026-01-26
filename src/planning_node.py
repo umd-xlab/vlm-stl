@@ -1,0 +1,1 @@
+# This file contains a ROS node implementing our VLM-STL planner
