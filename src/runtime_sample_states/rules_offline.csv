@@ -1,0 +1,6 @@
+rule,input,output,data_path
+'out = always(spd < 5);',,spd,runtime_sample_states/speed_limit.csv
+'out = always(dst > 1);',,dst,runtime_sample_states/object_distance.csv
+'out = ((srf < 0) implies eventually[0:5] (srf > 0));',,srf,runtime_sample_states/grass_movement.csv
+'out = ((dst > 0) implies eventually[0:5] (spd < 5));',dst,spd,runtime_sample_states/stop_sign_slowdown.csv
+'out = ((dst == 0) implies (always[0:3] (spd == 0) and eventually[3:4] (spd > 0)));',dst,spd,runtime_sample_states/stop_sign_stop.csv
