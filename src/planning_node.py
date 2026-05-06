@@ -604,53 +604,7 @@ class VLM_STL_Planner(Node):
         try:
             # Convert the ROS image message to OpenCV format and extract dimensions
             cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='rgb8')
-            self.img_h, self.img_w, _ = cv_image.shape
-            pil_image = PILImage.fromarray(cv_image)
-
-            # Process the text prompts and image input in batches
-            inputs = self.tokenizer(self.prompts, return_tensors="pt", padding=True, truncation=True, max_length=77)
-            image_inputs = self.processor(images=[pil_image] * len(self.prompts), return_tensors="pt")
-            depth_inputs = self.depth_processor(image=pil_image, return_tensors="pt").pixel_values.to(self.device)
-            inputs.update(image_inputs)
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-
-            # Perform model inference
-            start_time = time.time()
-            with torch.no_grad():
-                outputs = self.model(**inputs)
-                depth_outputs = self.depth_model(depth_inputs)
-            inference_time = time.time() - start_time
-
-            # Get prediction logits and apply sigmoid
-            preds = torch.sigmoid(outputs.logits)
             
-            output_depth = depth_outputs.predicted_depth
-            depth_map = F.interpolate(output_depth.unsqueeze(1), size=(self.img_h, self.img_w), mode="bilinear", align_corners=False).squeeze(1).cpu().numpy()
-            
-            camera_K = o3d.camera.PinholeCameraIntrinsic(self.img_w, self.img_h, np.array(self.Projection_Matrix[:3, :3]))
-            depth_o3d = o3d.geometry.Image((depth_map * 1000).astype(np.uint16))  # Convert to mm and uint16
-            point_cloud = o3d.geometry.PointCloud.create_from_depth_image(depth_o3d, camera_K, project_valid_depth_only=False)
-            points = np.asarray(point_cloud.points).reshape(self.img_h, self.img_w, 3)
-            self.point_cloud = points
-
-            # Initialize cost map (set to 128 for non-segmented areas)
-            combined_cost_map = np.zeros((self.img_h, self.img_w), 128, dtype=np.float32)
-
-            # Batch process segmentation masks and update the cost map
-            preds_resized = F.interpolate(preds.unsqueeze(1), size=(self.img_h, self.img_w), mode="bilinear", align_corners=False).squeeze(1).cpu().numpy()
-
-            # add cost values based on the priority order
-            for i, pred_resized in enumerate(preds_resized):
-                mask = pred_resized > self.prob_thresh
-                combined_cost_map[mask] = np.max(np.stack([combined_cost_map[mask], pred_resized[mask] * 255 * self.cost_values[i]]), axis=0)  # Update only segmented regions
-                
-            combined_cost_map[combined_cost_map == 0] = 128  # Set non-segmented areas to 128
-            
-            self.environment_state = preds_resized.transpose(1, 2, 0) > self.prob_thresh
-            
-            # Clip and convert cost map to 8-bit for visualization
-            combined_cost_map = np.clip(combined_cost_map, 0, 255).astype(np.uint8)
-            self.behav_costmap = combined_cost_map
 
             if self.publish_outputs:
                 # Apply color mapping for visualization and overlay on the original image
