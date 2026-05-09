@@ -6,6 +6,8 @@ from PIL import Image as PILImage
 import torch.nn.functional as F
 from scipy.spatial.transform import Rotation
 import matplotlib.pyplot as plt
+from scipy.interpolate import griddata
+from scipy import ndimage
 
 import os
 
@@ -14,7 +16,7 @@ import open3d as o3d
 
 class PerceptionModule:
     def __init__(self, camera_intrinsic_matrix, camera_offset_x, camera_offset_y, 
-                 camera_height, camera_tilt_angle, publish_outputs=True):
+                 camera_height, camera_tilt_angle, planar_costmap_scale=0.1, publish_outputs=True):
         # Set device for model computation
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -42,7 +44,7 @@ class PerceptionModule:
         self.camera_offset_y = camera_offset_y
         self.camera_height = camera_height
         self.camera_tilt_angle = camera_tilt_angle
-        
+        self.planar_costmap_scale = planar_costmap_scale
         self.publish_outputs = publish_outputs
         
     def process_image(self, image, segmentation_gt=None, depth_gt=None):
@@ -63,13 +65,13 @@ class PerceptionModule:
             with torch.no_grad():
                 outputs = self.seg_model(**seg_inputs, interpolate_pos_encoding=True)
                 multilabel_preds = torch.sigmoid(outputs.logits)
-                softmax_preds = torch.softmax(outputs.logits, dim=0)
-                print(F.one_hot(torch.argmax(softmax_preds, dim=0), num_classes=len(self.prompts)).shape)
-                state_one_hot = F.one_hot(torch.argmax(softmax_preds, dim=0), num_classes=len(self.prompts))  # Shape: (batch_size, num_classes, H, W)
+                preds = torch.argmax(torch.softmax(outputs.logits, dim=0), dim=0)
+                state_one_hot = F.one_hot(preds, num_classes=len(self.prompts))  # Shape: (batch_size, num_classes, H, W)
                 # Batch process segmentation masks and update the cost map
                 preds_resized = F.interpolate(multilabel_preds.unsqueeze(1), size=(self.img_h, self.img_w), mode="bilinear", align_corners=False).squeeze(1).cpu().numpy()
         else:
             segmentation_gt = torch.from_numpy(segmentation_gt).long()
+            preds = segmentation_gt  # Use ground truth segmentation for cost map generation
             preds_resized = F.one_hot(segmentation_gt, num_classes=len(self.prompts) + 1).permute(2, 0, 1)  # Shape: (batch_size, num_classes, H, W)
             state_one_hot = F.one_hot(segmentation_gt, num_classes=len(self.prompts) + 1).permute(2, 0, 1)  # Shape: (batch_size, num_classes, H, W)
         
@@ -83,18 +85,18 @@ class PerceptionModule:
         
         inference_time = time.time() - start_time
         print(f"Inference Time: {inference_time:.2f} seconds")
-        
-        plt.imshow(depth_map, cmap='inferno')
-        plt.colorbar()
-        plt.show()
-        plt.close()
 
         # Get prediction logits and apply sigmoid
         point_cloud_start_time = time.time()
         camera_K = o3d.camera.PinholeCameraIntrinsic(self.img_w, self.img_h, np.array(self.proj_matrix[:3, :3]))
         depth_o3d = o3d.geometry.Image(depth_map)  # Convert to mm and uint16
         point_cloud = o3d.geometry.PointCloud.create_from_depth_image(depth_o3d, camera_K, project_valid_depth_only=False)
-        points = np.asarray(point_cloud.points).reshape(self.img_h, self.img_w, 3)
+        tilt_rad = np.deg2rad(self.camera_tilt_angle)
+        rotation_matrix = np.array([[1, 0, 0],
+                                    [0, np.cos(tilt_rad), -np.sin(tilt_rad)],
+                                    [0, np.sin(tilt_rad), np.cos(tilt_rad)]])
+        points = np.asarray(point_cloud.points) @ rotation_matrix.T  # Apply rotation
+        points = points.reshape(self.img_h, self.img_w, 3) / self.planar_costmap_scale  # convert to cm
         self.point_cloud = points
         print(f"Point cloud generation time: {time.time() - point_cloud_start_time:.2f} seconds")
 
@@ -105,16 +107,64 @@ class PerceptionModule:
         for i, pred_resized in enumerate(preds_resized):
             combined_cost_map = np.max(np.stack([combined_cost_map, pred_resized * self.cost_values[i]]), axis=0)  # Update only segmented regions
             
-        combined_cost_map[combined_cost_map == 0] = 1  # Set non-segmented areas to 128
+        combined_cost_map[combined_cost_map == 0] = 128  # Set non-segmented areas to 128
         print(f"Cost map generation time: {time.time() - cost_map_start_time:.2f} seconds")
-        
-        
+
         self.environment_state = state_one_hot.cpu().numpy()  # Store the one-hot encoded environment state for later use
-        
+                
         # Clip and convert cost map to 8-bit for visualization
         combined_cost_map = np.clip(combined_cost_map, 0, 255).astype(np.uint8)
         self.image_costmap = combined_cost_map
         
+        self.get_top_down_environment_state()  # Generate top-down cost map for visualization and debugging
+        
+    def get_top_down_environment_state(self):
+        # Get the class with the highest probability for each pixel
+        class_indices = np.argmax(self.environment_state, axis=0)  # Shape: (H, W)
+        
+        points_with_class = np.concatenate((self.point_cloud, class_indices[..., np.newaxis]), axis=-1)
+        points_with_class = points_with_class.reshape(-1, 4)  # Reshape to (num_points, 4) where columns are (X, Y, Z, Class)
+        points_with_class = points_with_class[~np.isnan(points_with_class).any(axis=1)]  # Filter out points with NaN values
+        points_with_class = points_with_class[np.flip(points_with_class[:, 1].argsort(), axis=0)]  # reversed Sort by y-coordinate
+        
+        width = int(np.nanmax(points_with_class[:, 0]) - np.nanmin(points_with_class[:, 0])) + 1
+        height = int(np.nanmax(points_with_class[:, 2]) - np.nanmin(points_with_class[:, 2])) + 1
+        ground_plane_state_map = np.zeros((height, width), dtype=np.int32) - 1  # Initialize with -1 for unknown areas
+        ground_plane_state_map[(points_with_class[:, 2] - np.nanmin(points_with_class[:, 2])).astype(int), 
+                              (points_with_class[:, 0] - np.nanmin(points_with_class[:, 0])).astype(int)] = points_with_class[:, 3].astype(int)  # Assign class values to the ground plane state map
+        
+        data_points = np.where(ground_plane_state_map >= 0)
+        values = ground_plane_state_map[data_points]
+        fill_points = np.where(ground_plane_state_map < 0)
+        interpolated_values = griddata(data_points, values, fill_points, method='nearest', fill_value=-1)  # Fill in missing values with nearest neighbor interpolation
+        ground_plane_state_map[fill_points] = interpolated_values.astype(int)
+        
+        ground_plane_state_map = np.flip(ground_plane_state_map, axis=0)  # Flip vertically for correct orientation
+        
+        ground_plane_state_map = F.one_hot(torch.from_numpy(ground_plane_state_map.copy()).long(), num_classes=len(self.prompts) + 1).permute(2, 0, 1).numpy()  # Convert back to one-hot encoding for consistency
+        return ground_plane_state_map
+    
+    def get_top_down_costmap(self):
+        points_with_cost = np.concatenate((self.point_cloud, self.image_costmap[..., np.newaxis]), axis=-1)
+        points_with_cost = points_with_cost.reshape(-1, 4)  # Reshape to (num_points, 4) where columns are (X, Y, Z, Cost)
+        points_with_cost = points_with_cost[~np.isnan(points_with_cost).any(axis=1)]  # Filter out points with NaN values
+        points_with_cost = points_with_cost[np.flip(points_with_cost[:, 1].argsort(), axis=0)]  # reversed Sort by y-coordinate
+        
+        width = int(np.nanmax(points_with_cost[:, 0]) - np.nanmin(points_with_cost[:, 0])) + 1
+        height = int(np.nanmax(points_with_cost[:, 2]) - np.nanmin(points_with_cost[:, 2])) + 1
+        ground_plane_cost_map = np.zeros((height, width), dtype=np.float32)
+        ground_plane_cost_map[(points_with_cost[:, 2] - np.nanmin(points_with_cost[:, 2])).astype(int), 
+                              (points_with_cost[:, 0] - np.nanmin(points_with_cost[:, 0])).astype(int)] = points_with_cost[:, 3]  # Assign cost values to the ground plane cost map
+                
+        data_points = np.where(ground_plane_cost_map > 0)
+        values = ground_plane_cost_map[data_points]
+        fill_points = np.where(ground_plane_cost_map == 0)
+        interpolated_values = griddata(data_points, values, fill_points, method='linear', fill_value=0)  # Fill in missing values with nearest neighbor interpolation
+        ground_plane_cost_map[fill_points] = interpolated_values
+        
+        ground_plane_cost_map = np.flip(ground_plane_cost_map, axis=0)  # Flip vertically for correct orientation
+        
+        return ground_plane_cost_map
 
     # This function calculates the distance of the closest point from each class 
     # to the segment of the trajectory defined by points p1 and p2
@@ -164,6 +214,7 @@ class PerceptionModule:
 
         # Create a copy of the behavior cost map for visualization purposes
         marked_img = self.image_costmap.copy()
+        marked_img[marked_img == 128] = 0  # Set non-segmented areas to black for better visualization
         
         traj_lengths = np.linalg.norm(np.diff(robot_frame_trajectory, axis=0), axis=1)
         total_traj_length = np.sum(traj_lengths)
@@ -267,12 +318,12 @@ def single_image_test(intrinsic_matrix, offset_x, offset_y, height, tilt_angle, 
     combined_img = cv2.addWeighted(cv2.cvtColor(image, cv2.COLOR_RGB2BGR), 0.5, marked_color_img, 0.5, 0)
     cv2.imwrite("output_images/marked_image.png", combined_img)
     
-    fig = plt.figure(figsize=(10, 10))
-    ax = fig.add_subplot(1, 1, 1, projection='3d')
-    points = perception_module.point_cloud.reshape(-1, 3)
-    ax.scatter(points[:, 0], points[:, 1], points[:, 2], s=0.5, c=points[:, 2], cmap='inferno')
-    plt.show()
-    plt.close()
+    # fig = plt.figure(figsize=(10, 10))
+    # ax = fig.add_subplot(1, 1, 1, projection='3d')
+    # points = perception_module.point_cloud.reshape(-1, 3)
+    # ax.scatter(points[:, 0], points[:, 1], points[:, 2], s=0.5, c=points[:, 2], cmap='inferno')
+    # plt.show()
+    # plt.close()
     
     
     # Sample trajectory points in robot frame
@@ -312,9 +363,7 @@ if __name__ == "__main__":
     
     camera_height = 0.559221 + 0.503693 
     
-    rot_mat = Rotation.from_euler('xyz', [0, 0, 0], degrees=True).as_matrix()
-    
-    proj_matrix = intrinsic_matrix @ np.hstack((rot_mat, np.zeros((3, 1))))
+    proj_matrix = intrinsic_matrix @ np.hstack((np.eye(3), np.zeros((3, 1))))
     
     single_image_test(proj_matrix, 0, 0, extrinsic_matrix[0, 3], -euler_angles[0] + 90, args.image_path, segmentation, depth)
     
