@@ -8,7 +8,8 @@ from scipy.spatial.transform import Rotation
 import matplotlib.pyplot as plt
 from scipy.interpolate import griddata
 from matplotlib.colors import ListedColormap
-
+from utils.image_utils import load_calibration
+from utils.image_utils import RGB_color_dict
 from utils.gemini_utils import parse_segmentation_masks
 
 import os
@@ -360,7 +361,9 @@ class PerceptionModule:
         return marked_img, max_cost, total_cost, []
     
 def single_image_test(intrinsic_matrix, offset_x, offset_y, height, tilt_angle, image_path, segmentation_gt, depth_gt):
-    class_colors = [(255, 0, 0), (255, 255, 0), (255, 0, 255), (0, 0, 255), (0, 255, 0)]
+    # class_colors = [(255, 0, 0), (255, 255, 0), (255, 0, 255), (0, 0, 255), (0, 255, 0)]
+    class_colors = [RGB_color_dict['RED'], RGB_color_dict['YELLOW'], RGB_color_dict['MAGENTA'],
+                    RGB_color_dict['BLUE'], RGB_color_dict['GREEN']]
     segmentation_color_map = ListedColormap(np.array(class_colors) / 255.0)
     
     setup_start_time = time.time()
@@ -460,44 +463,52 @@ def single_image_test(intrinsic_matrix, offset_x, offset_y, height, tilt_angle, 
     colored_gt_segmentation = (colored_gt_segmentation * 255).astype(np.uint8)
     combined_gt_segmentation_img = cv2.addWeighted(cv2.cvtColor(image, cv2.COLOR_RGB2BGR), 0.5, colored_gt_segmentation, 0.5, 0)
     cv2.imwrite("output/gt_segmentation.png", combined_gt_segmentation_img)
-    
+
+
+def custom_extract_camera_matrices(json_path, gt_path):
+    with open(json_path, 'r') as f:
+        json_dict = json.load(f)
+
+    intrinsic_params = json_dict["cam_mat_intr"]
+    intrinsic = np.eye(3)
+    intrinsic[0, 0] = intrinsic_params["f_x"]
+    intrinsic[1, 1] = intrinsic_params["f_y"]
+    intrinsic[0, 2] = intrinsic_params["c_x"]
+    intrinsic[1, 2] = intrinsic_params["c_y"]
+    gt_maps = np.load(gt_path)
+    extrinsic = gt_maps['extrinsic_mat']
+    return intrinsic, extrinsic
+
 if __name__ == "__main__":
     import argparse, json
     parser = argparse.ArgumentParser(description="Test the PerceptionModule with a single image and trajectory.")
-    parser.add_argument("--intrinsic_matrix", type=str, required=True, help="Path to the camera intrinsic matrix (json file).")
-    parser.add_argument("--image_path", type=str, required=True, help="Path to the input image.")
-    parser.add_argument("--gt_path", type=str, required=True, help="Path to the .npz file containing ground truth segmentation and depth maps.")
+    parser.add_argument("--intrinsic_matrix", type=str, help="Path to the camera intrinsic matrix (json file).",
+                        default="../config/tf.json")
+    parser.add_argument("--image_path", type=str, help="Path to the input image.",
+                        default="../sample/crossing_13.png")
+    parser.add_argument("--gt_path", type=str, default=None, help="Path to the .npz file containing ground truth segmentation and depth maps.")
     
     args = parser.parse_args()
     
     program_start_time = time.time()
-    
-    print("Loading camera intrinsic parameters...")
-    
-    with open(args.intrinsic_matrix, 'r') as f:
-        json_dict = json.load(f)
-        
-    intrinsic_params = json_dict["cam_mat_intr"]
-    intrinsic_matrix = np.eye(3)
-    intrinsic_matrix[0, 0] = intrinsic_params["f_x"]
-    intrinsic_matrix[1, 1] = intrinsic_params["f_y"]
-    intrinsic_matrix[0, 2] = intrinsic_params["c_x"]
-    intrinsic_matrix[1, 2] = intrinsic_params["c_y"]
-    
+    # KALONJI this is your original load functions:
+    # intrinsic_matrix, extrinsic_matrix = custom_extract_camera_matrices(args.intrinsic_matrix, args.gt_path)
+    intrinsic_matrix, dist, T_base_from_cam = load_calibration(args.intrinsic_matrix, mode='spot')
     print("Loading ground truth segmentation and depth maps...")
-
-    gt_maps = np.load(args.gt_path)
-    segmentation = gt_maps['segmentation_masks']
-    depth = gt_maps['depth_map']
-    extrinsic_matrix = gt_maps['extrinsic_mat']
+    segmentation, depth = None, None
+    if args.gt_path is not None:
+        gt_maps = np.load(args.gt_path)
+        segmentation = gt_maps['segmentation_masks']
+        depth = gt_maps['depth_map']
+        # extrinsic_matrix = gt_maps['extrinsic_mat']
     
-    rot_mat = Rotation.from_matrix(extrinsic_matrix[:3, :3])
+    rot_mat = Rotation.from_matrix(T_base_from_cam[:3, :3])
     euler_angles = rot_mat.as_euler('xyz', degrees=True)
     
-    camera_height = 0.559221 + 0.503693 # for the blender image test
+    # camera_height = 0.559221 + 0.503693 # for the blender image test
     
     proj_matrix = intrinsic_matrix @ np.hstack((np.eye(3), np.zeros((3, 1))))
     
-    single_image_test(proj_matrix, 0, 0, extrinsic_matrix[0, 3], -euler_angles[0] + 90, args.image_path, segmentation, depth)
+    single_image_test(proj_matrix, 0, 0, T_base_from_cam[0, 3], -euler_angles[0] + 90, args.image_path, segmentation, depth)
     
     print(f"Total execution time: {time.time() - program_start_time:.2f} seconds")

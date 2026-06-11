@@ -62,6 +62,7 @@ RGB_color_dict = { # RGB
     "BLUE" : (0, 0, 255),
     "CYAN" : (0, 255, 255),
     "YELLOW" : (255, 255, 0),
+    "MAGENTA" : (255, 0, 255),
     "CUSTOM" : (125, 125, 125),
 }
 
@@ -210,7 +211,7 @@ def overlay_path(pts_cur: np.ndarray, img: Optional[np.ndarray] = None, cam_matr
     return overlay
 
 
-def load_calibration(json_path: str):
+def load_calibration(json_path: str, mode: str = "jackal"):
     """
     Builds:
       K (3x3), dist=None, T_cam_from_base (4x4)
@@ -218,29 +219,29 @@ def load_calibration(json_path: str):
     """
     with open(json_path, "r") as f:
         data = json.load(f)
+    entry = data.get(mode, None)
+    if entry is None or "H_cam_bl" not in entry:
+        raise ValueError(f"Missing '{mode}' in {json_path}")
 
-    if data is None or "H_cam_bl" not in data:
-        raise ValueError(f"Missing H_cam_bl in {json_path}")
-
-    h = data["H_cam_bl"]
+    h = entry["H_cam_bl"]
     roll = math.radians(float(h["roll"]))
     xt, yt, zt = float(h["x"]), float(h["y"]), float(h["z"])
 
     # Rotation about +y (camera pitched down is positive pitch if y up/right-handed)
     Ry = np.array([
-        [0.0, math.sin(roll), math.cos(roll)],
+        [ 0.0, math.sin(roll), math.cos(roll)],
         [-1.0, 0.0, 0.0],
-        [0.0, -math.cos(roll), math.sin(roll)]
+        [0.0, -math.cos(roll),  math.sin(roll)]
     ], dtype=np.float64)
 
     T_base_from_cam = np.eye(4, dtype=np.float64)
     T_base_from_cam[:3, :3] = Ry
-    T_base_from_cam[:3, 3] = np.array([xt, yt, zt], dtype=np.float64)
+    T_base_from_cam[:3, 3]  = np.array([xt, yt, zt], dtype=np.float64)
 
-    fx = data["Intrinsics"]["fx"]
-    fy = data["Intrinsics"]["fy"]
-    cx = data["Intrinsics"]["cx"]
-    cy = data["Intrinsics"]["cy"]
+    fx = data["scand_kinect_intrinsics"]["fx"]
+    fy = data["scand_kinect_intrinsics"]["fy"]
+    cx = data["scand_kinect_intrinsics"]["cx"]
+    cy = data["scand_kinect_intrinsics"]["cy"]
 
     K = np.array([[fx, 0.0, cx],
                   [0.0, fy, cy],
