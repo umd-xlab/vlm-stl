@@ -384,7 +384,7 @@ def single_image_test(intrinsic_matrix, offset_x, offset_y, height, tilt_angle, 
     print(f"Max True Cost along trajectory: {max_cost}")
     print(f"Total True Cost along trajectory: {total_cost}")
     
-    os.makedirs("output_images", exist_ok=True)
+    os.makedirs("output", exist_ok=True)
     drawn_marked_img = (marked_img / np.max(marked_img) * 255).astype(np.uint8)  # Normalize for better visualization
     marked_color_img = cv2.applyColorMap(drawn_marked_img, cv2.COLORMAP_JET)
     cv2.polylines(marked_color_img, [points], isClosed=False, color=(255, 0, 255), thickness=8)
@@ -393,7 +393,7 @@ def single_image_test(intrinsic_matrix, offset_x, offset_y, height, tilt_angle, 
     gt_path_costs = marked_img[gt_path_mask > 0]
     
     combined_img = cv2.addWeighted(cv2.cvtColor(image, cv2.COLOR_RGB2BGR), 0.5, marked_color_img, 0.5, 0)
-    cv2.imwrite("output_images/gt_marked_image.png", combined_img)
+    cv2.imwrite("output/gt_marked_image.png", combined_img)
     
     pred_perception_module = PerceptionModule(intrinsic_matrix, offset_x, offset_y, height, tilt_angle, segmentation_model='clipseg')
     pred_logits = pred_perception_module.process_image(image)
@@ -410,7 +410,7 @@ def single_image_test(intrinsic_matrix, offset_x, offset_y, height, tilt_angle, 
     pred_path_costs = marked_img_pred[pred_path_mask > 0]
     
     combined_img_pred = cv2.addWeighted(cv2.cvtColor(image, cv2.COLOR_RGB2BGR), 0.5, marked_color_img_pred, 0.5, 0)
-    cv2.imwrite("output_images/pred_marked_image.png", combined_img_pred)
+    cv2.imwrite("output/pred_marked_image.png", combined_img_pred)
     
     cost_error = np.abs(gt_path_costs - pred_path_costs)
     print(gt_path_costs.dtype, pred_path_costs.dtype, cost_error.dtype)
@@ -427,7 +427,7 @@ def single_image_test(intrinsic_matrix, offset_x, offset_y, height, tilt_angle, 
     drawn_error_map = (error_map / np.max(error_map) * 255).astype(np.uint8)  # Normalize for better visualization
     error_color_map = cv2.applyColorMap(drawn_error_map, cv2.COLORMAP_INFERNO)
     combined_error_img = cv2.addWeighted(cv2.cvtColor(image, cv2.COLOR_RGB2BGR), 0.5, error_color_map, 0.5, 0)
-    cv2.imwrite("output_images/cost_error_map.png", combined_error_img)
+    cv2.imwrite("output/cost_error_map.png", combined_error_img)
     
     pred_logits = np.concatenate((np.zeros((1, pred_logits.shape[1], pred_logits.shape[2]), dtype=np.float32), pred_logits), axis=0)  # Add background class with zero probability
 
@@ -435,14 +435,14 @@ def single_image_test(intrinsic_matrix, offset_x, offset_y, height, tilt_angle, 
     drawn_loss_img = (loss_img.squeeze().cpu().numpy() / np.max(loss_img.cpu().numpy()) * 255).astype(np.uint8)  # Normalize for better visualization
     loss_color_map = cv2.applyColorMap(drawn_loss_img, cv2.COLORMAP_JET)
     combined_loss_img = cv2.addWeighted(cv2.cvtColor(image, cv2.COLOR_RGB2BGR), 0.5, loss_color_map, 0.5, 0)
-    cv2.imwrite("output_images/loss_map.png", combined_loss_img)
+    cv2.imwrite("output/loss_map.png", combined_loss_img)
     
     traj_loss = np.zeros_like(marked_img, dtype=np.float32)
     traj_loss[pred_path_mask > 0] = loss_img.squeeze().cpu().numpy()[pred_path_mask > 0]
     drawn_traj_loss = (traj_loss / np.max(traj_loss) * 255).astype(np.uint8)  # Normalize for better visualization
     traj_loss_color_map = cv2.applyColorMap(drawn_traj_loss, cv2.COLORMAP_INFERNO)
     traj_loss_img = cv2.addWeighted(cv2.cvtColor(image, cv2.COLOR_RGB2BGR), 0.5, traj_loss_color_map, 0.5, 0)
-    cv2.imwrite("output_images/traj_loss_map.png", traj_loss_img)
+    cv2.imwrite("output/traj_loss_map.png", traj_loss_img)
     
     print(f"Average loss across image: {torch.mean(loss_img).item()}")
     print(f"Average loss along trajectory: {np.mean(loss_img.squeeze().cpu().numpy()[pred_path_mask > 0])}")
@@ -454,12 +454,12 @@ def single_image_test(intrinsic_matrix, offset_x, offset_y, height, tilt_angle, 
     colored_pred_segmentation = segmentation_color_map(pred_segmentation / (len(true_perception_module.prompts) + 1))[:, :, :3]  # Normalize for colormap and convert to RGB
     colored_pred_segmentation = (colored_pred_segmentation * 255).astype(np.uint8)
     combined_segmentation_img = cv2.addWeighted(cv2.cvtColor(image, cv2.COLOR_RGB2BGR), 0.5, colored_pred_segmentation, 0.5, 0)
-    cv2.imwrite("output_images/pred_segmentation.png", combined_segmentation_img)
+    cv2.imwrite("output/pred_segmentation.png", combined_segmentation_img)
     
     colored_gt_segmentation = segmentation_color_map(segmentation_gt / (len(true_perception_module.prompts) + 1))[:, :, :3]  # Normalize for colormap and convert to RGB
     colored_gt_segmentation = (colored_gt_segmentation * 255).astype(np.uint8)
     combined_gt_segmentation_img = cv2.addWeighted(cv2.cvtColor(image, cv2.COLOR_RGB2BGR), 0.5, colored_gt_segmentation, 0.5, 0)
-    cv2.imwrite("output_images/gt_segmentation.png", combined_gt_segmentation_img)
+    cv2.imwrite("output/gt_segmentation.png", combined_gt_segmentation_img)
     
 if __name__ == "__main__":
     import argparse, json
