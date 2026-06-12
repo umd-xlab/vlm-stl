@@ -1,4 +1,4 @@
-huggingface-hub==0.36.0
+huggingface-hub
 matplotlib==3.9.2
 numpy==1.26.4
 openai==2.2.0
@@ -8,7 +8,7 @@ pillow==10.4.0
 safetensors==0.5.3
 scikit-image==0.21.0
 scipy==1.10.1
-tokenizers==0.20.3
+tokenizers
 torch==2.11.0
 torchaudio==2.11.0
 torchvision==0.26.0
