@@ -9,7 +9,7 @@ class RTA:
         Master class used to conduct runtime assurance (rta)
 
         feed_path - (string) file path to where the robot state data will come in
-        rule_path - (string) file path to all stl logic rules to be implemented
+        rule_path - (string) file path to all stl logic rules to be instantiated
         robot_states_path - (string) OPTIONAL, file path, to be used for offline evaluation. Contains full trace of robot states
         stop_event - internal variable, used for parallel processing, passed through to all classes
 
@@ -64,7 +64,7 @@ class RTA:
 if __name__ == "__main__":
     """
     Sample setup to be run with 'python rta.py' from terminal
-    
+
     """
     r = RTA('feed.csv', 'rules.csv', robot_states_path='robot_states.csv')
     r.start_offline()
