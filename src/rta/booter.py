@@ -11,8 +11,8 @@ class Booter:
         feed_path - (string) file path to where the robot state data will come in
         rule_path - (string) file path to all stl logic rules to be instantiated
         stop_event - internal variable, used for parallel processing, passed through to all classes
-        failure_log - (string) file path where to send all stl rule violations
-        data_dump_log - (string) file path to where to send all outputed robustness values for stl rules
+        failure_log - (string) file path where to send all stl rule violations, passed through to each monitor instance
+        data_dump_log - (string) file path to where to send all outputed robustness values for stl rules, passed through to each monitor instance
 
         """
         self.feed_path = feed_path
