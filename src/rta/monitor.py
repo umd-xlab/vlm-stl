@@ -22,10 +22,12 @@ class Monitor:
         self.failure_log = failure_log
         self.data_dump_log = data_dump_log
         self.fig, self.graph = plt.subplots()
-        self.graph_data = ([0],[0])
+        self.rule_data = ([],[]) # tuple containing x and y values of generated rule robustness
+        self.state_data = {} #dictionary containing state datapoints for each variable
 
         self.add_rule(rule_line)
         self.instantiate_rule()
+        self.instantiate_state_data()
 
 
     def add_rule(self, line: list):
@@ -53,35 +55,45 @@ class Monitor:
         except rtamt.RTAMTException as err:
             print('RTAMT Exception: {}'.format(err))
             sys.exit()
+    
+    def instantiate_state_data(self):
+        for var in [self.input, self.output]:
+            if var is not None:
+                self.state_data[var] = ([],[])
+
 
     def update(self, line: pd.DataFrame):
-        has_values = True
+        vars_to_update = []
 
         for var in [self.input, self.output]:
             if var != None:
-                if pd.isna(line.iloc[0][var]):
-                    has_values = False
+                if not pd.isna(line.iloc[0][var]):
+                    vars_to_update.append(var)
         
         updates = []
 
-        if has_values:
-            for var in [self.input, self.output]:
-                if var != None:
-                    updates.append([var, [[float(line.iloc[0]['time']), float(line.iloc[0][var])]]])
+        for var in vars_to_update:
+            time = float(line.iloc[0]['time'])
+            signal = float(line.iloc[0][var])
+            self.state_data[var][0].append(time)
+            self.state_data[var][1].append(signal)
+            updates.append([var, [[time, signal]]])
+            print(f"Updating State {var} with data of time: {time} and signal: {signal}")
+        print(f"Total state dictionary: {self.state_data}")
 
-        print(f"Rule: {self.rule}. Met Criterion for Following Update: {updates}")
+        # print(f"Rule: {self.rule}. Met Criterion for Following Update: {updates}")
         rob = self.spec.update(*updates)
 
-        print(f"Rule: {self.rule}. Generated Robustness online: {rob}")
+        # print(f"Rule: {self.rule}. Generated Robustness online: {rob}")
 
-        if len(rob) != 0:
-            self.router(rob[0]) #because its an embedded list of lists
-            self.graph_data[0].append(rob[0][0])
-            self.graph_data[1].append(rob[0][1])
+        for i in range(0, len(rob)):
+            self.route_data(rob[i])
+            print(f"updating graph at time: {rob[i][0]} with value: {rob[i][1]}")
+            self.rule_data[0].append(rob[i][0])
+            self.rule_data[1].append(rob[i][1])
             self.update_graph()
 
-
-    def router(self, output):
+    def route_data(self, output):
         time = output[0]
         robustness = output[1]
         if robustness < 0:
@@ -94,11 +106,24 @@ class Monitor:
 
     def update_graph(self):
         self.graph.clear()
-        self.graph.plot(*self.graph_data)
+        self.graph.step(*self.rule_data, where='post', label = 'Rule Output Robustness')
+        for var in self.state_data:
+            self.graph.step(*self.state_data[var], where='post', label = f'{var}', alpha=0.5)
+
+        print(f"Current Graphing Data: {self.rule_data}")
+        start_shading = None
+        for (x,y) in zip(self.rule_data[0], self.rule_data[1]):
+            if y == float('inf') and start_shading is None:
+                start_shading = x
+            elif y != float('inf') and start_shading is not None:
+                self.graph.axvspan(start_shading, x, color='gray', alpha=0.25)
+                start_shading = None
+
         self.graph.grid(True, which='both')
         self.graph.set_title(f"Rule: {self.rule}", wrap=True)
         self.graph.axhline(y=0, color='k')
         self.graph.axvline(x=0, color='k')
+        self.graph.legend()
         plt.tight_layout()
         clean_name = sanitize_filename(self.rule, replacement_text="_")
         self.fig.savefig(f"plots/{clean_name}.png")
@@ -112,7 +137,7 @@ class Monitor:
             if cur_iter > current_lines:
                 current_lines = cur_iter
                 df = pd.read_csv(event.src_path)
-                print(f"Rule: {self.rule}. Detected the update: {df[-1:]}")
+                # print(f"Rule: {self.rule}. Detected the update: {df[-1:]}")
                 if current_lines != 1: #Skips the header
                     self.update(df[-1:])
 
