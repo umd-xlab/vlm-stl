@@ -10,8 +10,9 @@ class RTA:
 
         feed_path - (string) file path to where the robot state data will come in
         rule_path - (string) file path to all stl logic rules to be implemented
-        robot_states_path - OPTIONAL, to be used for offline evaluation. Contains full trace of robot states
+        robot_states_path - (string) OPTIONAL, file path, to be used for offline evaluation. Contains full trace of robot states
         stop_event - internal variable, used for parallel processing, passed through to all classes
+
         """
         self.feed_path = feed_path
         self.rule_path = rule_path
@@ -25,6 +26,7 @@ class RTA:
         Creates a stop event, to tell all threads when to shutdown
         Creates and starts the booter
         At the end, sets the stop event to terminate all threads
+
         """
         try:
             self.stop_event = multiprocessing.Event()
@@ -41,6 +43,7 @@ class RTA:
         Creates and starts the booter.
         Links the processes together so they terminate when the Dripper class is done sending robot_states_path data
         At the end, sets the stop event to terminate all threads
+
         """
         if self.robot_states = None:
             raise Exception("cannot start offline processing without robot states data")
@@ -59,7 +62,10 @@ class RTA:
             self.stop_event.set()
 
 if __name__ == "__main__":
-    #Sample setup to be run with 'python rta.py' from terminal
+    """
+    Sample setup to be run with 'python rta.py' from terminal
+    
+    """
     r = RTA('feed.csv', 'rules.csv', robot_states_path='robot_states.csv')
     r.start_offline()
     print("finished")
