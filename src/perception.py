@@ -8,7 +8,8 @@ from scipy.spatial.transform import Rotation
 import matplotlib.pyplot as plt
 from scipy.interpolate import griddata
 from matplotlib.colors import ListedColormap
-
+from utils.image_utils import load_calibration, clean_2d, project_clip, draw_polyline, BGR_color_dict
+from utils.image_utils import RGB_color_dict
 from utils.gemini_utils import parse_segmentation_masks
 
 import os
@@ -26,14 +27,14 @@ class PerceptionModule:
                  camera_height, camera_tilt_angle, segmentation_classes, segmentation_model='clipseg', planar_costmap_scale=0.1, logger=None):
         # Set device for model computation
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        
+
         if logger is None:
             logging.basicConfig(level=logging.INFO)
             self.logger = logging.getLogger("PerceptionModule")
         else:
             self.logger = logger
 
-        self.logger.info("Setting up Perception Module...")
+        self.logger.info(f"... Setting up Perception Module using {segmentation_model}")
         # Load the CLIPSeg model and processor
         if segmentation_model == 'clipseg':
             self.seg_processor = CLIPSegProcessor.from_pretrained("CIDAS/clipseg-rd64-refined")
@@ -59,10 +60,12 @@ class PerceptionModule:
 
         # load depth estimation processor and model
         depth_checkpoint = "depth-anything/Depth-Anything-V2-Metric-Outdoor-Base-hf"
+        self.logger.info(f"... Setting up depth checkpoint {depth_checkpoint}")
         self.depth_processor = AutoImageProcessor.from_pretrained(depth_checkpoint)
         self.depth_model = AutoModelForDepthEstimation.from_pretrained(depth_checkpoint).to(self.device)
-        
+
         self.prompts = ["A photo of a road", "A photo of a sidewalk", "A photo of a stop sign", "A photo of a building", "A photo of grass"]  # Prompts for segmentation
+        self.logger.info(f"depth_model loaded, prompts: {self.prompts}")
 
         # self.prob_thresh = 0.1  # Probability threshold for segmentation masks
         self.cost_values = [1, 5, 20, 20, 10]  # Cost values for each class in the same order as prompts
@@ -151,7 +154,7 @@ class PerceptionModule:
         self.logger.info(f"Inference Time: {inference_time:.2f} seconds")
 
         # Get prediction logits and apply sigmoid
-        point_cloud_start_time = time.time()
+        # point_cloud_start_time = time.time()
         camera_K = o3d.camera.PinholeCameraIntrinsic(self.img_w, self.img_h, np.array(self.proj_matrix[:3, :3]))
         depth_o3d = o3d.geometry.Image(depth_map)  # Convert to mm and uint16
         point_cloud = o3d.geometry.PointCloud.create_from_depth_image(depth_o3d, camera_K, project_valid_depth_only=False)
@@ -163,7 +166,7 @@ class PerceptionModule:
         points = points.reshape(self.img_h, self.img_w, 3) / self.planar_costmap_scale  # convert to arbitrary scale
         self.point_cloud = points
 
-        cost_map_start_time = time.time()
+        # cost_map_start_time = time.time()
         # Initialize cost map (set to 128 for non-segmented areas)
         combined_cost_map = np.zeros((self.img_h, self.img_w), dtype=np.float32)
         # add cost values based on the priority order
@@ -176,25 +179,25 @@ class PerceptionModule:
                 
         # Clip and convert cost map to 8-bit for visualization
         self.image_costmap = combined_cost_map
-                
+
         return pred_logits.cpu().numpy() # for use in evaluation work
-    
+
     def get_image_costmap(self):
         """
         Returns egocentric costmap of the scene
         """
-        
+
         return self.image_costmap.copy()
-        
+
     def get_top_down_environment_state(self):
         """
         Returns a top-down segmentation map used to determine surfaces at every location
-        The map is a one-hot encoded 3D array of shape (num_classes, H, W) 
+        The map is a one-hot encoded 3D array of shape (num_classes, H, W)
         Areas with no segmentation predictions will have a 1 in the background class channel and 0s in all other channels.
         The states are interpolated to fill missing values due to perspective and each value is the closest class to the gound plane at that loation
         The camera/robot is located at the top center of the map, at 0, W/2
         """
-        
+
         # Get the class with the highest probability for each pixel
         class_indices = np.argmax(self.environment_state, axis=2)  # Shape: (H, W)
         
@@ -231,7 +234,7 @@ class PerceptionModule:
         The costs are interpolated to fill missing values due to perspective
         The camera/robot is located at the top center of the map, at 0, W/2
         """
-        
+
         # assign cost values to each point in the point cloud
         points_with_cost = np.concatenate((self.point_cloud, self.image_costmap[..., np.newaxis]), axis=-1)
         points_with_cost = points_with_cost.reshape(-1, 4)  # Reshape to (num_points, 4) where columns are (X, Y, Z, Cost)
@@ -244,8 +247,8 @@ class PerceptionModule:
         ground_plane_cost_map = np.zeros((height, width), dtype=np.float32)
         ground_plane_cost_map[(points_with_cost[:, 2] - np.nanmin(points_with_cost[:, 2])).astype(int), 
                               (points_with_cost[:, 0] - np.nanmin(points_with_cost[:, 0])).astype(int)] = points_with_cost[:, 3]  # Assign cost values to the ground plane cost map
-        
-        # intepolate to fill in missing values in the cost map due to perspective 
+
+        # intepolate to fill in missing values in the cost map due to perspective
         data_points = np.where(ground_plane_cost_map > 0)
         values = ground_plane_cost_map[data_points]
         fill_points = np.where(ground_plane_cost_map == 0)
@@ -256,15 +259,15 @@ class PerceptionModule:
         
         return ground_plane_cost_map
 
-    
+
     def get_min_distance_to_classes(self, p1, p2, range_threshold):
         """
-        Calculates the distance of the closest point from each class 
+        Calculates the distance of the closest point from each class
         to the segment of the trajectory defined by points p1 and p2
         do this for all classes at once to benefit more from vectorization
         TODO: change to only do planar calculation for ground robots
         """
-        
+
         # vector representation of the trajectory segment from p1 to p2
         vector_traversed = p2 - p1
         # adjust point cloud to be relative to p1
@@ -305,7 +308,7 @@ class PerceptionModule:
         and return the maximum and total cost from the costmap at the trajectory pixel locations.
         Inputs:
         - robot_frame_trajectory (np.ndarray): array of (x, y) points in the robot's frame of reference
-        
+
         Returns: a visualization of the trajectory with costmap, the maximum cost along the trajectory, the total cost along the trajectory, and the pixel coordinates of the trajectory on the image.
         """
 
@@ -375,51 +378,74 @@ class PerceptionModule:
 
         # Visualize the trajectory points on the image
         points = np.vstack((valid_x, valid_y)).T
-        
+
         if len(points) > 1:
             cv2.polylines(marked_img, [points], isClosed=False, color=0, thickness=8)
 
         return marked_img, max_cost, total_cost, points
-    
-def single_image_test(intrinsic_matrix, offset_x, offset_y, height, tilt_angle, image_path, segmentation_gt=None, depth_gt=None):
+
+def single_image_test(intrinsic_matrix, offset_x, offset_y, T_base_from_cam,
+                      tilt_deg_offset, dist, image_path, segmentation_gt=None,
+                      depth_gt=None):
     """
     Test function to run the perception module on a single image and trajectory, and visualize the results.
     """
-    
-    class_colors = [(255, 0, 0), (255, 255, 0), (255, 0, 255), (0, 0, 255), (0, 255, 0)]
+    output_dir = "./output"
+    os.makedirs(output_dir, exist_ok=True)
+    # class_colors = [(255, 0, 0), (255, 255, 0), (255, 0, 255), (0, 0, 255), (0, 255, 0)]
+    class_colors = [RGB_color_dict['RED'], RGB_color_dict['YELLOW'], RGB_color_dict['MAGENTA'],
+                    RGB_color_dict['BLUE'], RGB_color_dict['GREEN']]
     segmentation_color_map = ListedColormap(np.array(class_colors) / 255.0)
-    
-    setup_start_time = time.time()    
-    
-    image = cv2.imread(image_path)
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)  # Convert to RGB for PIL
-    
+    K = intrinsic_matrix.copy()
+    intrinsic_matrix = intrinsic_matrix @ np.hstack((np.eye(3), np.zeros((3, 1))))
+    rot_mat = Rotation.from_matrix(T_base_from_cam[:3, :3])
+    euler_angles = rot_mat.as_euler('xyz', degrees=True)
+    tilt_angle = -euler_angles[0] + tilt_deg_offset
+
+    height = T_base_from_cam[0, 3]
+    T_cam_from_base = np.linalg.inv(T_base_from_cam)
+    setup_start_time = time.time()
+    # true_perception_module = PerceptionModule(intrinsic_matrix, offset_x, offset_y, height, tilt_angle)
+
+    img_bgr = cv2.imread(image_path)
+    image = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)  # Convert to RGB for PIL
+
     # example trajectories for Blender scene
-    # sample_trajectory = [[5, 0], [10, -2], [15, 0], [20, 0], [25, 0]] 
-    sample_trajectory = [[5, 0], [10, -2], [12, -4], [13, -4], [16, -3]] 
+    # sample_trajectory = [[5, 0], [10, -2], [15, 0], [20, 0], [25, 0]]
+    sample_trajectory = [[2.0, 0], [10, -2], [12, -4], [13, -4], [16, -3]]
+    xyz_traj = np.hstack((sample_trajectory, np.zeros((len(sample_trajectory), 1))))
+    # overlay trajectory
+    img = img_bgr.copy()
+    img_h, img_w = img.shape[:2]
+    points_2d = clean_2d(
+        project_clip(xyz_traj, T_cam_from_base, K, dist, img_h, img_w, clip_to_bottom=False),
+        img_w, img_h)
+    draw_polyline(img, points_2d, 2, BGR_color_dict['BLUE'])
+    cv2.imwrite(f"{output_dir}/image_overlay.png", img)
 
     classes = ["Road", "Sidewalk", "Stop sign", "Building", "Grass"]
-    
+
     # get predicted cost map and environment state from the perception module
     pred_perception_module = PerceptionModule(intrinsic_matrix, offset_x, offset_y, height, tilt_angle, classes, segmentation_model='clipseg')
-    print(f"Perception Module setup time: {time.time() - setup_start_time:.2f} seconds")
+    # print(f"Perception Module setup time: {time.time() - setup_start_time:.2f} seconds")
     pred_logits = pred_perception_module.process_image(image)
-    
+
     # visualize the predicted cost map and trajectory costs
     marked_img_pred, max_cost_pred, total_cost_pred, points_pred = pred_perception_module.get_traj_behav_cost(sample_trajectory, full_trajectory=True)
-    print(f"Predicted Max Cost along trajectory: {max_cost_pred}")
-    print(f"Predicted Total Cost along trajectory: {total_cost_pred}")
-    
+    print(f"Predicted Max Cost along trajectory: {max_cost_pred:.3f}")
+    print(f"Predicted Total Cost along trajectory: {total_cost_pred:.3f}")
+
     drawn_marked_img_pred = (marked_img_pred / np.max(marked_img_pred) * 255).astype(np.uint8)  # Normalize for better visualization
     marked_color_img_pred = cv2.applyColorMap(drawn_marked_img_pred, cv2.COLORMAP_JET)
     cv2.polylines(marked_color_img_pred, [points_pred], isClosed=False, color=(255, 0, 255), thickness=8)
-    
+
     pred_path_mask = cv2.polylines(np.zeros_like(marked_img_pred), [points_pred], isClosed=False, color=(255), thickness=10)
     pred_path_costs = marked_img_pred[pred_path_mask > 0]
-    
+
     combined_img_pred = cv2.addWeighted(cv2.cvtColor(image, cv2.COLOR_RGB2BGR), 0.5, marked_color_img_pred, 0.5, 0)
-    cv2.imwrite("output_images/pred_marked_image.png", combined_img_pred)
-    
+    draw_polyline(combined_img_pred, points_2d, 2, BGR_color_dict['RED'])
+    cv2.imwrite(f"{output_dir}/pred_marked_image.png", combined_img_pred)
+
     # If ground truth segmentation and depth maps are provided, calculate the true cost along the trajectory and compare with the predicted cost
     if segmentation_gt is not None and depth_gt is not None:
         processing_start_time = time.time()
@@ -428,26 +454,25 @@ def single_image_test(intrinsic_matrix, offset_x, offset_y, height, tilt_angle, 
 
         true_perception_module.process_image(image, segmentation_gt=segmentation_gt, depth_gt=depth_gt)
         print(f"Image processing time: {time.time() - processing_start_time:.2f} seconds")
-        
+
         cost_start_time = time.time()
         # visualize the true cost map and trajectory costs
         marked_img, max_cost, total_cost, points = true_perception_module.get_traj_behav_cost(sample_trajectory, full_trajectory=True)
         print(f"Trajectory cost calculation time: {time.time() - cost_start_time:.2f} seconds")
-        
+
         print(f"Max True Cost along trajectory: {max_cost}")
         print(f"Total True Cost along trajectory: {total_cost}")
-        
-        os.makedirs("output_images", exist_ok=True)
+
         drawn_marked_img = (marked_img / np.max(marked_img) * 255).astype(np.uint8)  # Normalize for better visualization
         marked_color_img = cv2.applyColorMap(drawn_marked_img, cv2.COLORMAP_JET)
         cv2.polylines(marked_color_img, [points], isClosed=False, color=(255, 0, 255), thickness=8)
-        
+
         gt_path_mask = cv2.polylines(np.zeros_like(marked_img), [points], isClosed=False, color=(255), thickness=10)
         gt_path_costs = marked_img[gt_path_mask > 0]
-        
+
         combined_img = cv2.addWeighted(cv2.cvtColor(image, cv2.COLOR_RGB2BGR), 0.5, marked_color_img, 0.5, 0)
-        cv2.imwrite("output_images/gt_marked_image.png", combined_img)
-    
+        cv2.imwrite(f"{output_dir}/gt_marked_image.png", combined_img)
+
         # evaluate predicted segmentation and cost map against ground truth along the trajectory
         cost_error = np.abs(gt_path_costs - pred_path_costs)
         print(gt_path_costs.dtype, pred_path_costs.dtype, cost_error.dtype)
@@ -458,29 +483,29 @@ def single_image_test(intrinsic_matrix, offset_x, offset_y, height, tilt_angle, 
         print(f"Total cost error along trajectory: {np.sum(cost_error)}")
         print(f"Average cost error along trajectory: {np.mean(cost_error)}")
         print(f"Max cost error along trajectory: {np.max(cost_error)}")
-        
+
         error_map = np.zeros_like(marked_img)
         error_map[pred_path_mask > 0] = cost_error
         drawn_error_map = (error_map / np.max(error_map) * 255).astype(np.uint8)  # Normalize for better visualization
         error_color_map = cv2.applyColorMap(drawn_error_map, cv2.COLORMAP_INFERNO)
         combined_error_img = cv2.addWeighted(cv2.cvtColor(image, cv2.COLOR_RGB2BGR), 0.5, error_color_map, 0.5, 0)
-        cv2.imwrite("output_images/cost_error_map.png", combined_error_img)
-        
+        cv2.imwrite(f"{output_dir}/cost_error_map.png", combined_error_img)
+
         pred_logits = np.concatenate((np.zeros((1, pred_logits.shape[1], pred_logits.shape[2]), dtype=np.float32), pred_logits), axis=0)  # Add background class with zero probability
 
         loss_img = F.cross_entropy(torch.from_numpy(pred_logits).unsqueeze(0), torch.from_numpy(segmentation_gt).long().unsqueeze(0), reduction='none').squeeze()
         drawn_loss_img = (loss_img.squeeze().cpu().numpy() / np.max(loss_img.cpu().numpy()) * 255).astype(np.uint8)  # Normalize for better visualization
         loss_color_map = cv2.applyColorMap(drawn_loss_img, cv2.COLORMAP_JET)
         combined_loss_img = cv2.addWeighted(cv2.cvtColor(image, cv2.COLOR_RGB2BGR), 0.5, loss_color_map, 0.5, 0)
-        cv2.imwrite("output_images/loss_map.png", combined_loss_img)
-        
+        cv2.imwrite(f"{output_dir}/loss_map.png", combined_loss_img)
+
         traj_loss = np.zeros_like(marked_img, dtype=np.float32)
         traj_loss[pred_path_mask > 0] = loss_img.squeeze().cpu().numpy()[pred_path_mask > 0]
         drawn_traj_loss = (traj_loss / np.max(traj_loss) * 255).astype(np.uint8)  # Normalize for better visualization
         traj_loss_color_map = cv2.applyColorMap(drawn_traj_loss, cv2.COLORMAP_INFERNO)
         traj_loss_img = cv2.addWeighted(cv2.cvtColor(image, cv2.COLOR_RGB2BGR), 0.5, traj_loss_color_map, 0.5, 0)
-        cv2.imwrite("output_images/traj_loss_map.png", traj_loss_img)
-        
+        cv2.imwrite(f"{output_dir}/traj_loss_map.png", traj_loss_img)
+
         print(f"Average loss across image: {torch.mean(loss_img).item()}")
         print(f"Average loss along trajectory: {np.mean(loss_img.squeeze().cpu().numpy()[pred_path_mask > 0])}")
         print(f"Max loss along trajectory: {np.max(loss_img.squeeze().cpu().numpy()[pred_path_mask > 0])}")
@@ -488,56 +513,60 @@ def single_image_test(intrinsic_matrix, offset_x, offset_y, height, tilt_angle, 
         colored_gt_segmentation = segmentation_color_map(segmentation_gt / (len(classes) + 1))[:, :, :3]  # Normalize for colormap and convert to RGB
         colored_gt_segmentation = (colored_gt_segmentation * 255).astype(np.uint8)
         combined_gt_segmentation_img = cv2.addWeighted(cv2.cvtColor(image, cv2.COLOR_RGB2BGR), 0.5, colored_gt_segmentation, 0.5, 0)
-        cv2.imwrite("output_images/gt_segmentation.png", combined_gt_segmentation_img)
-    
+        cv2.imwrite(f"{output_dir}/gt_segmentation.png", combined_gt_segmentation_img)
+
     # visualize the predicted segmentation map
     pred_env_state = pred_perception_module.environment_state
     pred_segmentation = np.argmax(pred_env_state, axis=2)
     colored_pred_segmentation = segmentation_color_map(pred_segmentation / (len(classes) + 1))[:, :, :3]  # Normalize for colormap and convert to RGB
     colored_pred_segmentation = (colored_pred_segmentation * 255).astype(np.uint8)
     combined_segmentation_img = cv2.addWeighted(cv2.cvtColor(image, cv2.COLOR_RGB2BGR), 0.5, colored_pred_segmentation, 0.5, 0)
-    cv2.imwrite("output_images/pred_segmentation.png", combined_segmentation_img)
-    
+    draw_polyline(combined_segmentation_img, points_2d, 2, BGR_color_dict['RED'])
+    cv2.imwrite(f"{output_dir}/pred_segmentation.png", combined_segmentation_img)
+
+
+def custom_extract_camera_matrices(json_path, gt_path):
+    with open(json_path, 'r') as f:
+        json_dict = json.load(f)
+
+    intrinsic_params = json_dict["cam_mat_intr"]
+    intrinsic = np.eye(3)
+    intrinsic[0, 0] = intrinsic_params["f_x"]
+    intrinsic[1, 1] = intrinsic_params["f_y"]
+    intrinsic[0, 2] = intrinsic_params["c_x"]
+    intrinsic[1, 2] = intrinsic_params["c_y"]
+    gt_maps = np.load(gt_path)
+    extrinsic = gt_maps['extrinsic_mat']
+    return intrinsic, extrinsic
+
 if __name__ == "__main__":
     import argparse, json
     parser = argparse.ArgumentParser(description="Test the PerceptionModule with a single image and trajectory.")
-    parser.add_argument("--intrinsic_matrix", type=str, required=True, help="Path to the camera intrinsic matrix (json file).")
-    parser.add_argument("--image_path", type=str, required=True, help="Path to the input image.")
-    parser.add_argument("--gt_path", type=str, required=False, help="Path to the .npz file containing ground truth segmentation and depth maps.")
+    parser.add_argument("--intrinsic_matrix", type=str, help="Path to the camera intrinsic matrix (json file).",
+                        default="../config/tf.json")
+    parser.add_argument("--image_path", type=str, help="Path to the input image.",
+                        default="../sample/crossing_13.png")
+    parser.add_argument("--gt_path", type=str, default=None, help="Path to the .npz file containing ground truth segmentation and depth maps.")
     
     args = parser.parse_args()
     
     program_start_time = time.time()
-    
-    print("Loading camera intrinsic parameters...")
-    
-    with open(args.intrinsic_matrix, 'r') as f:
-        json_dict = json.load(f)
-        
-    intrinsic_params = json_dict["cam_mat_intr"]
-    intrinsic_matrix = np.eye(3)
-    intrinsic_matrix[0, 0] = intrinsic_params["f_x"]
-    intrinsic_matrix[1, 1] = intrinsic_params["f_y"]
-    intrinsic_matrix[0, 2] = intrinsic_params["c_x"]
-    intrinsic_matrix[1, 2] = intrinsic_params["c_y"]
-    
+    # KALONJI this is your original load functions:
+    # intrinsic_matrix, extrinsic_matrix = custom_extract_camera_matrices(args.intrinsic_matrix, args.gt_path)
+    intrinsic_matrix, dist, T_base_from_cam = load_calibration(args.intrinsic_matrix, mode='spot')
     print("Loading ground truth segmentation and depth maps...")
-
-    camera_height = 0.559221 + 0.503693 #m for the blender image test
-    camera_tilt = -3.14505439503068 # degrees
-    proj_matrix = intrinsic_matrix @ np.hstack((np.eye(3), np.zeros((3, 1))))
+    segmentation, depth = None, None
 
     if args.gt_path is not None:
         # if given gt from blender, use gt maps and extrinsic matrix
         gt_maps = np.load(args.gt_path)
         segmentation = gt_maps['segmentation_masks']
         depth = gt_maps['depth_map']
-        extrinsic_matrix = gt_maps['extrinsic_mat']
-    
-        rot_mat = Rotation.from_matrix(extrinsic_matrix[:3, :3])
-        euler_angles = rot_mat.as_euler('xyz', degrees=True)
-        single_image_test(proj_matrix, 0, 0, extrinsic_matrix[0, 3], -euler_angles[0] + 90, args.image_path, segmentation, depth)
     else:
-        single_image_test(proj_matrix, 0, 0, camera_height, camera_tilt, args.image_path, segmentation_gt=None, depth_gt=None)
-    
+        segmentation, depth = None, None
+
+    single_image_test(intrinsic_matrix, 0, 0, T_base_from_cam, 90, dist, args.image_path,
+                      segmentation,
+                      depth)
+
     print(f"Total execution time: {time.time() - program_start_time:.2f} seconds")
