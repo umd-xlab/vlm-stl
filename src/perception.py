@@ -4,7 +4,6 @@ import torch
 import time
 from PIL import Image as PILImage
 import torch.nn.functional as F
-from scipy.spatial.transform import Rotation
 import matplotlib.pyplot as plt
 from scipy.interpolate import griddata
 from matplotlib.colors import ListedColormap
@@ -23,8 +22,8 @@ from google.genai import types
 import logging
 
 class PerceptionModule:
-    def __init__(self, camera_intrinsic_matrix, camera_offset_x, camera_offset_y, 
-                 camera_height, camera_tilt_angle, segmentation_classes, segmentation_model='clipseg', planar_costmap_scale=0.1, logger=None):
+    def __init__(self, camera_intrinsic_matrix, T_base_from_cam, segmentation_classes, class_costs,
+                 segmentation_model='clipseg', planar_costmap_scale=1, logger=None):
         # Set device for model computation
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -55,8 +54,9 @@ class PerceptionModule:
             ]
             self.model_id = "gemini-2.5-flash"
             self.classes = segmentation_classes
-            self.prompt = "Give the segmentation masks for the following objects in the given image: " + ", ".join(self.classes) + ". Output a JSON list of segmentation masks where each entry contains the 2D bounding box in the key \"box_2d\", the segmentation mask in key \"mask\" as a base64 png string starting with \"data:image/png;base64\", and the text label in the key \"label\". The label should be provided exactly as given in the prompt."
+            self.prompts = "Give the segmentation masks for the following objects in the given image: " + ", ".join(self.classes) + ". Output a JSON list of segmentation masks where each entry contains the 2D bounding box in the key \"box_2d\", the segmentation mask in key \"mask\" as a base64 png string starting with \"data:image/png;base64\", and the text label in the key \"label\". The label should be provided exactly as given in the prompt."
             
+        self.base_transform = T_base_from_cam
 
         # load depth estimation processor and model
         depth_checkpoint = "depth-anything/Depth-Anything-V2-Metric-Outdoor-Base-hf"
@@ -64,21 +64,16 @@ class PerceptionModule:
         self.depth_processor = AutoImageProcessor.from_pretrained(depth_checkpoint)
         self.depth_model = AutoModelForDepthEstimation.from_pretrained(depth_checkpoint).to(self.device)
 
-        self.prompts = ["A photo of a road", "A photo of a sidewalk", "A photo of a stop sign", "A photo of a building", "A photo of grass"]  # Prompts for segmentation
         self.logger.info(f"depth_model loaded, prompts: {self.prompts}")
 
         # self.prob_thresh = 0.1  # Probability threshold for segmentation masks
-        self.cost_values = [1, 5, 20, 20, 10]  # Cost values for each class in the same order as prompts
+        self.cost_values = class_costs  # Cost values for each class in the same order as prompts
         self.image_costmap = None
         self.environment_state = None
         self.point_cloud = None
         self.seg_model_name = segmentation_model
         
-        self.proj_matrix = camera_intrinsic_matrix  # Projection matrix for camera intrinsics
-        self.camera_offset_x = camera_offset_x
-        self.camera_offset_y = camera_offset_y
-        self.camera_height = camera_height
-        self.camera_tilt_angle = camera_tilt_angle
+        self.intrinsic_matrix = camera_intrinsic_matrix  # Projection matrix for camera intrinsics
         self.planar_costmap_scale = planar_costmap_scale
         
     def process_image(self, image, segmentation_gt=None, depth_gt=None):
@@ -88,7 +83,6 @@ class PerceptionModule:
         pil_image = PILImage.fromarray(image)
 
         # Process the text prompts and image input in batches
-        preprocess_start_time = time.time()
         if self.seg_model_name == 'groupvit':
             seg_inputs = self.seg_processor(text=self.prompts, images=pil_image, padding=True, return_tensors="pt").to(self.device)
         elif self.seg_model_name == 'clipseg':
@@ -112,7 +106,7 @@ class PerceptionModule:
                 elif self.seg_model_name == 'gemini':
                     response = self.seg_model.models.generate_content(
                         model=self.model_id,
-                        contents=[self.prompt, pil_image],
+                        contents=[self.prompts, pil_image],
                         config = types.GenerateContentConfig(
                             temperature=0.5,
                             safety_settings=self.safety_settings,
@@ -155,15 +149,14 @@ class PerceptionModule:
 
         # Get prediction logits and apply sigmoid
         # point_cloud_start_time = time.time()
-        camera_K = o3d.camera.PinholeCameraIntrinsic(self.img_w, self.img_h, np.array(self.proj_matrix[:3, :3]))
+        camera_K = o3d.camera.PinholeCameraIntrinsic(self.img_w, self.img_h, np.array(self.intrinsic_matrix))
         depth_o3d = o3d.geometry.Image(depth_map)  # Convert to mm and uint16
         point_cloud = o3d.geometry.PointCloud.create_from_depth_image(depth_o3d, camera_K, project_valid_depth_only=False)
-        tilt_rad = np.deg2rad(self.camera_tilt_angle)
-        rotation_matrix = np.array([[1, 0, 0],
-                                    [0, np.cos(tilt_rad), -np.sin(tilt_rad)],
-                                    [0, np.sin(tilt_rad), np.cos(tilt_rad)]])
-        points = np.asarray(point_cloud.points) @ rotation_matrix.T  # Apply rotation
+        point_cloud = point_cloud.transform(self.base_transform)  # Transform to robot frame using camera offset and height
+        
+        points = np.asarray(point_cloud.points)
         points = points.reshape(self.img_h, self.img_w, 3) / self.planar_costmap_scale  # convert to arbitrary scale
+        # TODO: convert to robot frame using camera offset and height
         self.point_cloud = points
 
         # cost_map_start_time = time.time()
@@ -260,7 +253,7 @@ class PerceptionModule:
         return ground_plane_cost_map
 
 
-    def get_min_distance_to_classes(self, p1, p2, range_threshold):
+    def get_min_distance_to_classes_aerial(self, p1, p2, range_threshold):
         """
         Calculates the distance of the closest point from each class
         to the segment of the trajectory defined by points p1 and p2
@@ -272,8 +265,18 @@ class PerceptionModule:
         vector_traversed = p2 - p1
         # adjust point cloud to be relative to p1
         adjusted_class_points = self.point_cloud.reshape(-1, 3) - p1
+        
+        flattened_environment_state = self.environment_state.reshape(-1, self.environment_state.shape[-1])
+        
+        p1_distances = np.linalg.norm(adjusted_class_points, axis=1)
+        p2_distances = np.linalg.norm(adjusted_class_points - vector_traversed, axis=1)
+        
+        t_values = np.dot(adjusted_class_points, vector_traversed) / np.dot(vector_traversed, vector_traversed)
+        vector_adjusted_class_points = adjusted_class_points[(t_values >= 0) & (t_values <= 1)]
+        vector_environment_state = flattened_environment_state[(t_values >= 0) & (t_values <= 1)]
+        
         # use cross product definition of shortest distance from a point to a line
-        distances = np.linalg.norm(np.cross(adjusted_class_points, vector_traversed), axis=1) / np.linalg.norm(vector_traversed)
+        vector_distances = np.linalg.norm(np.cross(vector_adjusted_class_points, vector_traversed), axis=1) / np.linalg.norm(vector_traversed)
         # alternative distance calculation; may be faster
         # rejection_vectors = adjusted_class_points - np.dot(adjusted_class_points, vector_traversed)[:, np.newaxis] / np.dot(vector_traversed, vector_traversed) * vector_traversed
         # distances = np.linalg.norm(rejection_vectors, axis=1) / np.linalg.norm(vector_traversed)
@@ -281,13 +284,23 @@ class PerceptionModule:
         min_distances = []
         safest_points = []
         for class_id, cost_value in enumerate(self.cost_values):
-            class_distances = distances[self.environment_state[class_id].flatten()]
-            if class_distances.size > 0:
-                class_min_dist = np.min(class_distances)
+            vector_class_distances = vector_distances[(np.argmax(vector_environment_state, axis=1) == class_id + 1).flatten()]
+            p1_distances_class = p1_distances[(np.argmax(flattened_environment_state, axis=1) == class_id + 1).flatten()]
+            p2_distances_class = p2_distances[(np.argmax(flattened_environment_state, axis=1) == class_id + 1).flatten()]
+            
+            if len(p1_distances_class) > 0:
+                class_min_dist = min(np.min(vector_class_distances) if len(vector_class_distances) > 0 else float('inf'), 
+                                     np.min(p1_distances_class), np.min(p2_distances_class))
+                
+                if class_min_dist == np.min(p1_distances_class):
+                    closest_point = adjusted_class_points[np.argmin(p1_distances_class)]
+                elif class_min_dist == np.min(p2_distances_class):
+                    closest_point = adjusted_class_points[np.argmin(p2_distances_class)]
+                else:
+                    closest_point = vector_adjusted_class_points[np.argmin(vector_class_distances)]
                 
                 # if too close to an obstacle of this class, calculate the safest point to steer towards 
                 if class_min_dist < range_threshold:
-                    closest_point = adjusted_class_points[np.argmin(class_distances)]
                     # will be removed if rejection vector method is faster
                     rejection_vector = closest_point - np.dot(closest_point, vector_traversed) / np.dot(vector_traversed, vector_traversed) * vector_traversed
                     
@@ -299,6 +312,75 @@ class PerceptionModule:
                 min_distances.append(class_min_dist)
             else:
                 min_distances.append(float('inf'))
+        
+        return min_distances, safest_points
+    
+    def get_min_distance_to_classes_ground(self, p1, p2, range_threshold, height_threshold=0.5):
+        """
+        Calculates the distance of the closest point from each class
+        to the segment of the trajectory defined by points p1 and p2
+        do this for all classes at once to benefit more from vectorization
+        """
+
+        # vector representation of the trajectory segment from p1 to p2
+        vector_traversed = p2 - p1
+        # adjust point cloud to be relative to p1
+        ground_cloud = self.point_cloud.reshape(-1, 3)
+        ground_cloud_clipped = ground_cloud[ground_cloud[:, 2] < height_threshold]  # Filter points based on height threshold
+        ground_states = self.environment_state.reshape(-1, self.environment_state.shape[-1])[ground_cloud[:, 2] < height_threshold]
+        ground_cloud_clipped[:, 2] = 0  # Project to ground plane by setting z-coordinate to 0
+        adjusted_class_points = ground_cloud_clipped - p1
+        
+        print("Number of ground points considered: {}".format(adjusted_class_points.shape[0]))
+        
+        p1_distances = np.linalg.norm(adjusted_class_points, axis=1)
+        p2_distances = np.linalg.norm(adjusted_class_points - vector_traversed, axis=1)
+        
+        # collect points that are between start and end
+        # project points onto the line defined by p1 and p2
+        t_values = np.dot(adjusted_class_points, vector_traversed) / np.dot(vector_traversed, vector_traversed)
+        vector_adjusted_class_points = adjusted_class_points[(t_values >= 0) & (t_values <= 1)]
+        vector_ground_states = ground_states[(t_values >= 0) & (t_values <= 1)]
+
+        # use cross product definition of shortest distance from a point to a line
+        vector_distances = (np.linalg.norm(np.cross(vector_adjusted_class_points, vector_traversed), axis=1) / np.linalg.norm(vector_traversed)).flatten()
+        
+        # alternative distance calculation; may be faster
+        # rejection_vectors = adjusted_class_points - np.dot(adjusted_class_points, vector_traversed[:2])[:, np.newaxis] / np.dot(vector_traversed[:2], vector_traversed[:2]) * vector_traversed[:2]
+        # distances = np.linalg.norm(rejection_vectors, axis=1) / np.linalg.norm(vector_traversed[:2])
+        
+        min_distances = []
+        safest_points = []
+        for class_id, cost_value in enumerate(self.cost_values):
+            vector_class_distances = vector_distances[(np.argmax(vector_ground_states, axis=1) == class_id + 1).flatten()]
+            p1_distances_class = p1_distances[(np.argmax(ground_states, axis=1) == class_id + 1).flatten()]
+            p2_distances_class = p2_distances[(np.argmax(ground_states, axis=1) == class_id + 1).flatten()]
+            
+            if len(p1_distances_class) > 0:
+                class_min_dist = min(np.min(vector_class_distances) if len(vector_class_distances) > 0 else float('inf'), np.min(p1_distances_class), np.min(p2_distances_class))
+                
+                if class_min_dist == np.min(p1_distances_class):
+                    closest_point = adjusted_class_points[np.argmin(p1_distances_class)]
+                elif class_min_dist == np.min(p2_distances_class):
+                    closest_point = adjusted_class_points[np.argmin(p2_distances_class)]
+                else:
+                    closest_point = vector_adjusted_class_points[np.argmin(vector_class_distances)]
+                
+                # if too close to an obstacle of this class, calculate the safest point to steer towards 
+                if class_min_dist < range_threshold:
+                    
+                    # will be removed if rejection vector method is faster
+                    rejection_vector = closest_point - np.dot(closest_point, vector_traversed) / np.dot(vector_traversed, vector_traversed) * vector_traversed
+                    
+                    safe_point = closest_point - rejection_vector * (range_threshold / np.linalg.norm(rejection_vector))
+                    safest_points.append(safe_point + p1)  # Transform back to global coordinates
+                else:
+                    safest_points.append(None)
+                
+                min_distances.append(class_min_dist)
+            else:
+                min_distances.append(float('inf'))
+                safest_points.append(None)
         
         return min_distances, safest_points
 
@@ -325,29 +407,16 @@ class PerceptionModule:
         # Extract x_rob and y_rob from the trajectory
         x_rob = robot_frame_trajectory[:, 0]
         y_rob = robot_frame_trajectory[:, 1]
+        
+        T_cam_from_base = np.linalg.inv(self.base_transform)
 
         # Vectorized computation for camera frame coordinates
-        traj_coords_xyz = np.column_stack((
-            -y_rob + self.camera_offset_y,   # Y-axis adjustment
-            np.full(x_rob.shape, -self.camera_height),  # Constant camera height
-            x_rob - self.camera_offset_x  # X-axis adjustment
-        ))
-
+        traj_coords_xyz = T_cam_from_base @ np.vstack((x_rob, y_rob, np.zeros_like(x_rob), np.ones_like(x_rob)))  # Shape: (4, N)
         if traj_coords_xyz.shape[0] == 0:
             return marked_img, 0.0, 0, []
 
-        # Apply rotation for tilt
-        alpha = np.deg2rad(self.camera_tilt_angle)
-        rotation_matrix = np.array([[1, 0, 0],
-                                    [0, np.cos(alpha), -np.sin(alpha)],
-                                    [0, np.sin(alpha), np.cos(alpha)]])
-        points_rotated = np.dot(traj_coords_xyz, rotation_matrix.T)
-
-        # Homogeneous coordinates for projection
-        points_homogeneous = np.hstack((points_rotated, np.ones((points_rotated.shape[0], 1))))
-
         # Project onto image plane using the projection matrix
-        uvw = np.dot(self.proj_matrix, points_homogeneous.T)
+        uvw = np.dot(self.intrinsic_matrix, traj_coords_xyz[:3])
         u_vec, v_vec, w_vec = uvw[0], uvw[1], uvw[2]
 
         # Compute pixel coordinates
@@ -384,9 +453,8 @@ class PerceptionModule:
 
         return marked_img, max_cost, total_cost, points
 
-def single_image_test(intrinsic_matrix, offset_x, offset_y, T_base_from_cam,
-                      tilt_deg_offset, dist, image_path, segmentation_gt=None,
-                      depth_gt=None):
+def single_image_test(intrinsic_matrix, T_base_from_cam, dist, image_path, 
+                      segmentation_gt=None, depth_gt=None):
     """
     Test function to run the perception module on a single image and trajectory, and visualize the results.
     """
@@ -397,36 +465,30 @@ def single_image_test(intrinsic_matrix, offset_x, offset_y, T_base_from_cam,
                     RGB_color_dict['BLUE'], RGB_color_dict['GREEN']]
     segmentation_color_map = ListedColormap(np.array(class_colors) / 255.0)
     K = intrinsic_matrix.copy()
-    intrinsic_matrix = intrinsic_matrix @ np.hstack((np.eye(3), np.zeros((3, 1))))
-    rot_mat = Rotation.from_matrix(T_base_from_cam[:3, :3])
-    euler_angles = rot_mat.as_euler('xyz', degrees=True)
-    tilt_angle = -euler_angles[0] + tilt_deg_offset
-
-    height = T_base_from_cam[0, 3]
+    
     T_cam_from_base = np.linalg.inv(T_base_from_cam)
-    setup_start_time = time.time()
-    # true_perception_module = PerceptionModule(intrinsic_matrix, offset_x, offset_y, height, tilt_angle)
 
     img_bgr = cv2.imread(image_path)
     image = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)  # Convert to RGB for PIL
 
     # example trajectories for Blender scene
     # sample_trajectory = [[5, 0], [10, -2], [15, 0], [20, 0], [25, 0]]
-    sample_trajectory = [[2.0, 0], [10, -2], [12, -4], [13, -4], [16, -3]]
+    # sample_trajectory = [[2.0, 0], [10, -2], [12, -4], [13, -4], [16, -3]]
+    sample_trajectory = [[2, 0], [4, 0], [12, -2], [13, -1], [16, 1]]
+
     xyz_traj = np.hstack((sample_trajectory, np.zeros((len(sample_trajectory), 1))))
     # overlay trajectory
     img = img_bgr.copy()
     img_h, img_w = img.shape[:2]
-    points_2d = clean_2d(
-        project_clip(xyz_traj, T_cam_from_base, K, dist, img_h, img_w, clip_to_bottom=False),
-        img_w, img_h)
+    points_2d = project_clip(xyz_traj, T_cam_from_base, K, dist, img_h, img_w, clip_to_bottom=False)
     draw_polyline(img, points_2d, 2, BGR_color_dict['BLUE'])
     cv2.imwrite(f"{output_dir}/image_overlay.png", img)
 
-    classes = ["Road", "Sidewalk", "Stop sign", "Building", "Grass"]
+    classes = ["Road", "Sidewalk", "Tree", "Building", "Grass"]
+    class_costs = [1, 5, 20, 20, 10]
 
     # get predicted cost map and environment state from the perception module
-    pred_perception_module = PerceptionModule(intrinsic_matrix, offset_x, offset_y, height, tilt_angle, classes, segmentation_model='clipseg')
+    pred_perception_module = PerceptionModule(intrinsic_matrix, T_base_from_cam, classes, class_costs, segmentation_model='clipseg')
     # print(f"Perception Module setup time: {time.time() - setup_start_time:.2f} seconds")
     pred_logits = pred_perception_module.process_image(image)
 
@@ -445,12 +507,16 @@ def single_image_test(intrinsic_matrix, offset_x, offset_y, T_base_from_cam,
     combined_img_pred = cv2.addWeighted(cv2.cvtColor(image, cv2.COLOR_RGB2BGR), 0.5, marked_color_img_pred, 0.5, 0)
     draw_polyline(combined_img_pred, points_2d, 2, BGR_color_dict['RED'])
     cv2.imwrite(f"{output_dir}/pred_marked_image.png", combined_img_pred)
+    
+    print("Calculating minimum distances to classes along the trajectory...")
+    
+    print(pred_perception_module.get_min_distance_to_classes_ground(np.array([2, 0, 0]), np.array([4, 0, 0]), range_threshold=2, height_threshold=0.5))
 
     # If ground truth segmentation and depth maps are provided, calculate the true cost along the trajectory and compare with the predicted cost
     if segmentation_gt is not None and depth_gt is not None:
         processing_start_time = time.time()
         # get true cost map and environment state
-        true_perception_module = PerceptionModule(intrinsic_matrix, offset_x, offset_y, height, tilt_angle, classes)
+        true_perception_module = PerceptionModule(intrinsic_matrix, T_base_from_cam, classes, class_costs)
 
         true_perception_module.process_image(image, segmentation_gt=segmentation_gt, depth_gt=depth_gt)
         print(f"Image processing time: {time.time() - processing_start_time:.2f} seconds")
@@ -515,6 +581,7 @@ def single_image_test(intrinsic_matrix, offset_x, offset_y, T_base_from_cam,
         combined_gt_segmentation_img = cv2.addWeighted(cv2.cvtColor(image, cv2.COLOR_RGB2BGR), 0.5, colored_gt_segmentation, 0.5, 0)
         cv2.imwrite(f"{output_dir}/gt_segmentation.png", combined_gt_segmentation_img)
 
+
     # visualize the predicted segmentation map
     pred_env_state = pred_perception_module.environment_state
     pred_segmentation = np.argmax(pred_env_state, axis=2)
@@ -525,7 +592,7 @@ def single_image_test(intrinsic_matrix, offset_x, offset_y, T_base_from_cam,
     cv2.imwrite(f"{output_dir}/pred_segmentation.png", combined_segmentation_img)
 
 
-def custom_extract_camera_matrices(json_path, gt_path):
+def extract_blender_camera_matrices(json_path, gt_path):
     with open(json_path, 'r') as f:
         json_dict = json.load(f)
 
@@ -552,7 +619,8 @@ if __name__ == "__main__":
     
     program_start_time = time.time()
     # KALONJI this is your original load functions:
-    # intrinsic_matrix, extrinsic_matrix = custom_extract_camera_matrices(args.intrinsic_matrix, args.gt_path)
+    # intrinsic_matrix, extrinsic_matrix = extract_blender_camera_matrices(args.intrinsic_matrix, args.gt_path)
+    # extrinsic_matrix = np.concatenate((extrinsic_matrix, np.array([[0, 0, 0, 1]])), axis=0)  # Convert to 4x4 homogeneous matrix
     intrinsic_matrix, dist, T_base_from_cam = load_calibration(args.intrinsic_matrix, mode='spot')
     print("Loading ground truth segmentation and depth maps...")
     segmentation, depth = None, None
@@ -565,8 +633,8 @@ if __name__ == "__main__":
     else:
         segmentation, depth = None, None
 
-    single_image_test(intrinsic_matrix, 0, 0, T_base_from_cam, 90, dist, args.image_path,
-                      segmentation,
-                      depth)
+    single_image_test(intrinsic_matrix, T_base_from_cam, dist, args.image_path,
+                      segmentation, depth)
+    # single_image_test(intrinsic_matrix, extrinsic_matrix, 1000, args.image_path, segmentation, depth)
 
     print(f"Total execution time: {time.time() - program_start_time:.2f} seconds")

@@ -38,6 +38,7 @@ from threading import Condition, Lock
 from utils.odometry_utils import *
 
 from perception import PerceptionModule
+from utils.image_utils import load_calibration
 
 class ControlLawSettings:
     # (self, K1=1.2, K2=1, BETA=0.4, LAMBDA=2, V_MAX=0.8, V_MIN=0.0, R_THRESH=0.05):
@@ -346,18 +347,14 @@ class VLM_STL_Planner(Node):
         self.obstacle_dists = None
 
         #traj projection params
-        self.Projection_Matrix = [[910.7625732421875, 0.0, 643.8300781250, 0.0],[0.0,910.8343505859375,373.2903137207031,0.0],[0.0, 0.0, 1.0, 0.0]] # realsense lidar camera L515
+        # TODO: make a ros param
+        self.config_file = "config/tf.json"
+        self.intrinsic_matrix, self.dist, self.T_cam_from_base = load_calibration(self.config_file)
 
         # self.Projection_Matrix = [[607.175048828125, 0.0, 322.55340576171875, 0.0], [0.0, 607.222900390625, 248.86021423339844, 0.0], [0.0, 0.0, 1.0, 0.0]] # realsense lidar camera L515
-
-        self.camera_height = 0.59 #1.01 #height of the camera w.r.t. the robot's base/ground level
-        self.camera_tilt_angle = 0 # in degrees, downward is negative
-        self.camera_offset_x = 0 #0.46
-        self.camera_offset_y = 0 #0.065 #camera y axis offset in meters
         
         self.gt_depth_image = None
-        self.perception_module = PerceptionModule(self.Projection_Matrix, self.camera_offset_x, self.camera_offset_y, 
-                                                  self.camera_height, self.camera_tilt_angle, segmentation_classes=self.prompts, 
+        self.perception_module = PerceptionModule(self.intrinsic_matrix, self.T_cam_from_base, segmentation_classes=self.prompts, 
                                                   segmentation_model = "clipseg", planar_costmap_scale=0.1, logger=self.get_logger())
 
     def wait_for_odom(self):
