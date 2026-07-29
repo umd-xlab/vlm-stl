@@ -39,6 +39,7 @@ from utils.odometry_utils import *
 
 from perception import PerceptionModule
 from utils.image_utils import load_calibration
+import matplotlib.pyplot as plt
 
 class ControlLawSettings:
     # (self, K1=1.2, K2=1, BETA=0.4, LAMBDA=2, V_MAX=0.8, V_MIN=0.0, R_THRESH=0.05):
@@ -341,9 +342,10 @@ class VLM_STL_Planner(Node):
         
         # self.prompts = ["Stop_Gesture", "Pavement", "Grass"]  # Prompts for segmentation
         self.prompts = ["Road", "Sidewalk", "Stop sign", "Building", "Grass"]
+        self.class_costs = [1, 5, 20, 20, 10]
         
         # Flag to control output publishing
-        self.publish_outputs = False
+        self.publish_outputs = True
         self.obstacle_dists = None
 
         #traj projection params
@@ -354,7 +356,7 @@ class VLM_STL_Planner(Node):
         # self.Projection_Matrix = [[607.175048828125, 0.0, 322.55340576171875, 0.0], [0.0, 607.222900390625, 248.86021423339844, 0.0], [0.0, 0.0, 1.0, 0.0]] # realsense lidar camera L515
         
         self.gt_depth_image = None
-        self.perception_module = PerceptionModule(self.intrinsic_matrix, self.T_cam_from_base, segmentation_classes=self.prompts, 
+        self.perception_module = PerceptionModule(self.intrinsic_matrix, self.T_cam_from_base, segmentation_classes=self.prompts, class_costs=self.class_costs,
                                                   segmentation_model = "clipseg", planar_costmap_scale=0.1, logger=self.get_logger())
 
     def wait_for_odom(self):
@@ -393,7 +395,7 @@ class VLM_STL_Planner(Node):
 
             else:
                 # TODO: change to reflect new planning loop
-                self.generate_trajectory()
+                time.sleep(1)  # Simulate some processing time
                 
                 # new_coords, new_vMax = self.find_intermediate_goal_params()
 
@@ -405,6 +407,7 @@ class VLM_STL_Planner(Node):
             self.pub.publish(self.speed)
         else:
             print(" -- Waiting for odom to intialize -- ")
+            time.sleep(1)
 
         loop_end_time = time.time()
         tot_inference_time = loop_end_time - loop_start_time
@@ -614,16 +617,21 @@ class VLM_STL_Planner(Node):
                 self.perception_module.process_image(cv_image)            
 
             if self.publish_outputs:
-                image_costmap = self.perception_module.get_image_costmap()
+                image_costmap = self.perception_module.get_image_costmap().astype(np.uint8)
+                image_costmap_scaled = (image_costmap * (255.0 / max(self.class_costs))).astype(np.uint8)  # Scale to 0-255
+        
                 # Apply color mapping for visualization and overlay on the original image
-                combined_cost_map_colored = cv2.applyColorMap(image_costmap, cv2.COLORMAP_JET)
+                combined_cost_map_colored = cv2.applyColorMap(image_costmap_scaled, cv2.COLORMAP_JET)
+                combined_cost_map_colored = cv2.cvtColor(combined_cost_map_colored, cv2.COLOR_BGR2RGB)  # Convert to RGB for consistency
                 overlaid_image = cv2.addWeighted(cv_image, 0.4, combined_cost_map_colored, 0.6, 0)
+                
+
                 ros_overlaid_image = self.bridge.cv2_to_imgmsg(overlaid_image, encoding='rgb8')
                 self.behav_costmap_publisher.publish(ros_overlaid_image)
 
             # Log the inference time
             end_time2 = time.time()
-            self.get_logger().info(f"CLIPSeg Model Inference Time: {1/(end_time2 - start_time):.4f} seconds")
+            self.get_logger().info(f"CLIPSeg Model Inference Time: {(end_time2 - start_time):.4f} seconds")
 
             self.received_img_once = True
 
