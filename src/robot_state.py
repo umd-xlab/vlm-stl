@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+"""Shared state and data contracts for navigation integration.
+
+This is a PASSIVE DATA OBJECTS only file! Do not call ROS, RRT-X, or RTA monitors directly. The ROS planning node should update these objects instead.
+"""
+
 from dataclasses import dataclass, field
 import csv
 import math
@@ -11,7 +16,10 @@ import numpy as np
 
 
 Point2D = tuple[float, float]
+"""Planar point represented as (x, y)."""
+
 Waypoint = tuple[float, float]
+"""Route waypoint represented as (x, y)."""
 
 
 @dataclass
@@ -84,11 +92,11 @@ class Observation:
     """Perception snapshot from camera/depth/segmentation processing.
 
     Inputs:
-        timestamp: Observation time in seconds.
-        point_cloud: Optional dense/sparse 3D point cloud.
-        image_costmap: Optional image-frame costmap.
-        top_down_costmap: Optional robot/world-frame costmap for planning.
-        top_down_semantics: Optional projected semantic labels or one-hot map.
+        timestamp: Observation time (seconds)
+        point_cloud: dense/sparse 3D point cloud. (Optional)
+        image_costmap: image-frame costmap. (Optional)
+        top_down_costmap: robot/world-frame costmap for planning. (optional)
+        top_down_semantics: projected semantic labels or one-hot map. (optional)
         class_names: Semantic class labels used by perception.
         class_distances: Minimum distances to semantic classes.
         metadata: Extra perception data that does not fit fixed fields.
@@ -286,6 +294,10 @@ class RobotState:
     def update_pose(self, pose: Pose2D, timestamp: float | None = None) -> None:
         """Update current/previous pose and estimate speed from pose delta.
 
+        This is usually called from the odometry callback in planning_node.py.
+        It stores both the latest pose and enough history to estimate linear
+        speed when an explicit velocity estimate is not available.
+
         Inputs:
             pose: New robot pose.
             timestamp: Optional timestamp in seconds. If None, elapsed_time() is used.
@@ -323,6 +335,10 @@ class RobotState:
     def update_observation(self, observation: Observation) -> None:
         """Update current/previous perception observation.
 
+        This is the handoff point from the perception team into the integration
+        layer.  The observation may contain raw image-frame products, top-down
+        planning products, semantic distances, or any combination of those.
+
         Inputs:
             observation: New perception snapshot.
         """
@@ -333,6 +349,10 @@ class RobotState:
 
     def update_route(self, route: Route) -> None:
         """Update current/previous planned route.
+
+        This is the handoff point from the planner back into shared state.  RTA
+        pre-checks, live monitors, and controllers can all inspect the same
+        current_route after this method is called.
 
         Inputs:
             route: New planner output or accepted route.
@@ -406,6 +426,10 @@ class RobotState:
 
     def append_rta_feed(self, feed_path: str | Path, timestamp: float | None = None) -> RTASignals:
         """Append current RTA signals to a CSV feed file.
+
+        This method is the integration layer's current contract with the RTA
+        monitors.  It writes the columns time, spd, dst, srf, and sdst without
+        requiring RobotState to know how the monitor processes those values.
 
         Inputs:
             feed_path: Path to RTA feed CSV.
