@@ -101,6 +101,9 @@ class ControlLaw:
     def convert_to_egopolar(self, current_state, current_goal_pose):
         """
         Converts a goal position from Cartesian coordinates (in the odom frame) to egocentric polar coordinates (in the robot's frame).
+        ego: from the perspective of the robot (self)
+        polar: using polar coordinates like distance/radius and angle/heading
+        
 
         Inputs:
         current_state: The current position and orientation of the robot in the world frame (as a list [x, y, yaw]).

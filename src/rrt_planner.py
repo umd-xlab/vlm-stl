@@ -3,13 +3,15 @@ from __future__ import annotations
 """Planner integration layer used by the ROS node.
 
 This module gives the rest of the project one stable planner API even though the
-current low-level implementation lives in ``rrt-x.py``.  The ROS glue code should
+current low-level implementation lives in ``rrtx.py``.  The ROS glue code should
 call ``RRTPlanner.plan(...)`` and receive a ``Route`` object without needing to
 know how RRT-X is loaded, how costmaps are adapted, or whether a fallback was
 used.
 """
 
 from dataclasses import dataclass
+from enum import Enum
+import time
 import importlib.util
 import math
 from pathlib import Path
@@ -61,6 +63,39 @@ class PlannerSettings:
     seed: int | None = None
 
 
+class PlannerStatus(str, Enum):
+    """Outcome categories for a planner invocation."""
+
+    SUCCESS = "success"
+    NO_PATH = "no_path"
+    IMPORT_ERROR = "import_error"
+    PLANNER_ERROR = "planner_error"
+    INVALID_INPUT = "invalid_input"
+    FALLBACK = "fallback"
+
+
+@dataclass
+class PlannerResult:
+    """Typed planner outcome and reproducibility metadata."""
+
+    route: Route | None
+    status: PlannerStatus
+    message: str
+    planning_time_s: float
+    seed: int | None
+    goal_tolerance_m: float
+    goal_error_m: float | None
+    goal_reached: bool
+    frame_id: str
+    position_units: str
+    time_units: str
+    map_version: str | None
+    origin: Point
+    resolution_m: float
+    lethal_cost: float
+    fallback_used: bool = False
+
+
 class RRTPlanner:
     """High-level planner that converts RobotState into a Route.
 
@@ -102,27 +137,85 @@ class RRTPlanner:
         Raises:
             ValueError: If robot_state does not contain a current pose or goal.
         """
-        start = robot_state.planner_start()
-        goal = robot_state.planner_goal()
+        result = self.plan_result(robot_state, observation, cost_adjustments, allow_fallback=True)
+        if result.route is None:
+            raise ValueError(result.message)
+        return result.route
+
+    def plan_result(
+        self,
+        robot_state: RobotState,
+        observation: Observation | None = None,
+        cost_adjustments: dict[str, Any] | np.ndarray | None = None,
+        *,
+        allow_fallback: bool = False,
+        frame_id: str = "map",
+        position_units: str = "meters",
+        time_units: str = "seconds",
+        map_version: str | None = None,
+        goal_tolerance_m: float = 0.75,
+    ) -> PlannerResult:
+        """Plan and return a typed result without hiding planner failures."""
+        start_time = time.perf_counter()
+        try:
+            start = robot_state.planner_start()
+            goal = robot_state.planner_goal()
+        except ValueError as error:
+            return PlannerResult(
+                None, PlannerStatus.INVALID_INPUT, str(error), time.perf_counter() - start_time,
+                self.settings.seed, goal_tolerance_m, None, False, frame_id, position_units, time_units,
+                map_version, self.settings.origin, self.settings.resolution, self.settings.lethal_cost,
+            )
+
         observation = observation or robot_state.current_observation
         costmap = self._build_costmap(robot_state, observation, cost_adjustments)
         bounds = self.settings.bounds or self._infer_bounds(start, goal, costmap)
-        waypoints = self._plan_with_rrtx(start, goal, bounds, costmap)
+        status, waypoints, message = self._plan_with_rrtx_result(start, goal, bounds, costmap)
+        fallback_used = False
         planner_name = "rrtx"
-        if not waypoints:
+        if not waypoints and allow_fallback and status in {PlannerStatus.NO_PATH, PlannerStatus.IMPORT_ERROR, PlannerStatus.PLANNER_ERROR}:
             waypoints = self._straight_line(start, goal, self.settings.fallback_samples)
-            planner_name = "straight_line"
-        route = route_from_waypoints(waypoints, costs={"distance": self._path_distance(waypoints)})
-        route.trajectory = [Pose2D(x, y) for x, y in route.waypoints]
-        route.metadata.update(
-            {
-                "planner": planner_name,
-                "samples": self._trajectory_samples(route.waypoints),
-                "bounds": bounds,
-                "used_costmap": costmap is not None,
-            }
+            status = PlannerStatus.FALLBACK
+            message = "RRT-X did not produce a route; returned explicit straight-line fallback"
+            planner_name = "straight_line_fallback"
+            fallback_used = True
+
+        waypoints = self._remove_consecutive_duplicates(waypoints)
+
+        route = None
+        goal_error = None
+        goal_reached = False
+        if waypoints:
+            route = route_from_waypoints(waypoints, costs={"distance": self._path_distance(waypoints)})
+            route.trajectory = [Pose2D(x, y) for x, y in route.waypoints]
+            goal_error = math.hypot(waypoints[-1][0] - goal[0], waypoints[-1][1] - goal[1])
+            goal_reached = goal_error <= goal_tolerance_m
+            route.metadata.update(
+                {
+                    "planner": planner_name,
+                    "samples": self._trajectory_samples(route.waypoints),
+                    "bounds": bounds,
+                    "used_costmap": costmap is not None,
+                    "frame_id": frame_id,
+                    "position_units": position_units,
+                    "time_units": time_units,
+                    "map_version": map_version,
+                    "origin_m": list(self.settings.origin),
+                    "resolution_m": self.settings.resolution,
+                    "lethal_cost": self.settings.lethal_cost,
+                    "seed": self.settings.seed,
+                }
+            )
+        elif status == PlannerStatus.SUCCESS:
+            status = PlannerStatus.NO_PATH
+            message = "RRT-X returned no usable waypoints"
+
+        return PlannerResult(
+            route, status, message, time.perf_counter() - start_time,
+            self.settings.seed, goal_tolerance_m, goal_error, goal_reached, frame_id,
+            position_units, time_units, map_version, self.settings.origin,
+            self.settings.resolution, self.settings.lethal_cost, fallback_used,
         )
-        return route
 
     def _plan_with_rrtx(
         self,
@@ -142,9 +235,19 @@ class RRTPlanner:
             Ordered waypoint list from start to goal, or an empty list if RRT-X
             cannot load, fails, or does not find a path.
         """
+        _, waypoints, _ = self._plan_with_rrtx_result(start, goal, bounds, costmap)
+        return waypoints
+
+    def _plan_with_rrtx_result(
+        self,
+        start: Point,
+        goal: Point,
+        bounds: tuple[float, float, float, float],
+        costmap: np.ndarray | None,
+    ) -> tuple[PlannerStatus, list[Point], str]:
         module = self._load_rrtx()
         if module is None:
-            return []
+            return PlannerStatus.IMPORT_ERROR, [], "Unable to import rrtx.py"
         config = module.RRTXConfig(
             bounds=bounds,
             step_size=self.settings.step_size,
@@ -155,7 +258,7 @@ class RRTPlanner:
             seed=self.settings.seed,
         )
         try:
-            return module.plan_rrtx(
+            waypoints = module.plan_rrtx(
                 start,
                 goal,
                 bounds,
@@ -164,11 +267,14 @@ class RRTPlanner:
                 resolution=self.settings.resolution,
                 config=config,
             )
-        except Exception:
-            return []
+        except Exception as error:
+            return PlannerStatus.PLANNER_ERROR, [], f"RRT-X raised {type(error).__name__}: {error}"
+        if not waypoints:
+            return PlannerStatus.NO_PATH, [], "RRT-X returned no path"
+        return PlannerStatus.SUCCESS, waypoints, "RRT-X returned a route"
 
     def _load_rrtx(self):
-        """Load ``rrt-x.py`` despite the hyphen in its filename.
+        """Load ``rrtx.py``
 
         Returns:
             Imported module object with RRTXConfig and plan_rrtx, or None if the
@@ -176,8 +282,8 @@ class RRTPlanner:
         """
         if self._rrtx_module is not None:
             return self._rrtx_module
-        path = Path(__file__).with_name("rrt-x.py")
-        spec = importlib.util.spec_from_file_location("rrt_x", path)
+        path = Path(__file__).with_name("rrtx.py")
+        spec = importlib.util.spec_from_file_location("rrtx", path)
         if spec is None or spec.loader is None:
             return None
         module = importlib.util.module_from_spec(spec)
@@ -284,7 +390,8 @@ class RRTPlanner:
         previous = None
         for index, point in enumerate(waypoints):
             if previous is not None:
-                elapsed += math.hypot(point[0] - previous[0], point[1] - previous[1]) / max(self.settings.nominal_speed, 1e-6)
+                segment_time = math.hypot(point[0] - previous[0], point[1] - previous[1]) / max(self.settings.nominal_speed, 1e-6)
+                elapsed += segment_time
             samples.append(
                 {
                     "index": float(index),
@@ -297,6 +404,17 @@ class RRTPlanner:
             )
             previous = point
         return samples
+
+    @staticmethod
+    def _remove_consecutive_duplicates(waypoints: list[Point]) -> list[Point]:
+        """Remove adjacent identical points before route timing and serialization."""
+        if not waypoints:
+            return []
+        normalized = [waypoints[0]]
+        for point in waypoints[1:]:
+            if point != normalized[-1]:
+                normalized.append(point)
+        return normalized
 
     def _path_distance(self, waypoints: list[Point]) -> float:
         """Compute total length of a waypoint path.
@@ -330,4 +448,4 @@ def plan(
     return RRTPlanner(settings).plan(robot_state, observation, cost_adjustments)
 
 
-__all__ = ["PlannerSettings", "RRTPlanner", "plan"]
+__all__ = ["PlannerResult", "PlannerSettings", "PlannerStatus", "RRTPlanner", "plan"]
