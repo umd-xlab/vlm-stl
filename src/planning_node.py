@@ -44,6 +44,8 @@ from rrt_planner import RRTPlanner
 from utils.image_utils import load_calibration
 import matplotlib.pyplot as plt
 
+import argparse
+
 class ControlLawSettings:
     # (self, K1=1.2, K2=1, BETA=0.4, LAMBDA=2, V_MAX=0.8, V_MIN=0.0, R_THRESH=0.05):
     def __init__(self, K1=1, K2=3, BETA=1, LAMBDA=1, V_MAX=1.0, V_MIN=0.0, R_THRESH=0.05):
@@ -660,7 +662,7 @@ class VLM_STL_Planner(Node):
         
     #     return distances_to_obstacles
     
-    def image_callback(self, msg):
+    def image_callback(self, msg, save_path=None):
         try:
             # Convert the ROS image message to OpenCV format and extract dimensions
             cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='rgb8')
@@ -683,7 +685,9 @@ class VLM_STL_Planner(Node):
                 combined_cost_map_colored = cv2.applyColorMap(image_costmap_scaled, cv2.COLORMAP_JET)
                 combined_cost_map_colored = cv2.cvtColor(combined_cost_map_colored, cv2.COLOR_BGR2RGB)  # Convert to RGB for consistency
                 overlaid_image = cv2.addWeighted(cv_image, 0.4, combined_cost_map_colored, 0.6, 0)
-                
+
+                if save_path:
+                    cv2.imwrite(save_path, cv2.cvtColor(overlaid_image, cv2.COLOR_RGB2BGR))
 
                 ros_overlaid_image = self.bridge.cv2_to_imgmsg(overlaid_image, encoding='rgb8')
                 self.behav_costmap_publisher.publish(ros_overlaid_image)
@@ -769,8 +773,27 @@ class VLM_STL_Planner(Node):
 if __name__ == '__main__':
     
     rclpy.init()
+    
+    arg_parser = argparse.ArgumentParser(description='VLM-STL Planner Node')
+    arg_parser.add_argument('--image-path', type=str, default=None, help='Path to an image file for testing')
+    arg_parser.add_argument('--save-path', type=str, default=None, help='Path to save the overlaid image')
+    args = arg_parser.parse_args()
+    
+    img_msg = None
+    
+    if args.image_path:
+        cv_image = cv2.imread(args.image_path)
+        if cv_image is None:
+            raise FileNotFoundError(f"Error: Could not read image from {args.image_path}") 
+        else:
+            img_msg = CvBridge().cv2_to_imgmsg(cv_image, encoding='rgb8')            
 
     node = VLM_STL_Planner()
+    
+    if img_msg is not None:
+        if args.save_path:
+            os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
+        node.image_callback(img_msg, save_path=args.save_path)
     
     try:
         node.run()
