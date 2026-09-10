@@ -21,13 +21,8 @@ from nav_msgs.msg import OccupancyGrid, Odometry, GridCells
 from sensor_msgs.msg import LaserScan, CompressedImage, NavSatFix
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
-from PIL import Image as PILImage
 import torch
-import torch.nn.functional as F
-from transformers import CLIPSegProcessor, CLIPSegForImageSegmentation, CLIPTokenizer, AutoImageProcessor, AutoModelForDepthEstimation
 # import nevergrad as ng
-
-import open3d as o3d
 
 import copy
 import time
@@ -36,13 +31,15 @@ import matplotlib.colors as mcolors
 
 # import utm
 
-import nlopt
 from concurrent.futures import ProcessPoolExecutor
 from scipy.spatial import KDTree
 from threading import Condition, Lock
 
 from utils.odometry_utils import *
 
+from perception import PerceptionModule
+from utils.image_utils import load_calibration
+import matplotlib.pyplot as plt
 
 class ControlLawSettings:
     # (self, K1=1.2, K2=1, BETA=0.4, LAMBDA=2, V_MAX=0.8, V_MIN=0.0, R_THRESH=0.05):
@@ -259,6 +256,7 @@ class VLM_STL_Planner(Node):
         # self.sub_cost_map = self.create_subscription(GridCells, '/costmap_translator/obstacles', self.config.occupancy_map_callback,self.qos_profile)
 
         self.subscription = self.create_subscription(Image,'/camera/color/image_raw', self.image_callback, 10)
+        self.depth_subscription = self.create_subscription(Image,'/camera/depth/image_raw', self.depth_image_callback, 10)
         # Publisher for combined overlaid image
         self.behav_costmap_publisher = self.create_publisher(Image, '/behav_costmap', 10)
         self.traj_image_pub = self.create_publisher(Image, '/traj_marked_image', 10)
@@ -343,20 +341,23 @@ class VLM_STL_Planner(Node):
         self.img_h, self.img_w = None, None
         
         # self.prompts = ["Stop_Gesture", "Pavement", "Grass"]  # Prompts for segmentation
+        self.prompts = ["Road", "Sidewalk", "Stop sign", "Building", "Grass"]
+        self.class_costs = [1, 5, 20, 20, 10]
         
         # Flag to control output publishing
-        self.publish_outputs = False
+        self.publish_outputs = True
         self.obstacle_dists = None
 
         #traj projection params
-        self.Projection_Matrix = [[910.7625732421875, 0.0, 643.8300781250, 0.0],[0.0,910.8343505859375,373.2903137207031,0.0],[0.0, 0.0, 1.0, 0.0]] # realsense lidar camera L515
+        # TODO: make a ros param
+        self.config_file = "config/tf.json"
+        self.intrinsic_matrix, self.dist, self.T_cam_from_base = load_calibration(self.config_file)
 
         # self.Projection_Matrix = [[607.175048828125, 0.0, 322.55340576171875, 0.0], [0.0, 607.222900390625, 248.86021423339844, 0.0], [0.0, 0.0, 1.0, 0.0]] # realsense lidar camera L515
-
-        self.camera_height = 0.59 #1.01 #height of the camera w.r.t. the robot's base/ground level
-        self.camera_tilt_angle = 0 # in degrees, downward is negative
-        self.camera_offset_x = 0 #0.46
-        self.camera_offset_y = 0 #0.065 #camera y axis offset in meters
+        
+        self.gt_depth_image = None
+        self.perception_module = PerceptionModule(self.intrinsic_matrix, self.T_cam_from_base, segmentation_classes=self.prompts, class_costs=self.class_costs,
+                                                  segmentation_model = "clipseg", planar_costmap_scale=0.1, logger=self.get_logger())
 
     def wait_for_odom(self):
         # Wait for the odom message
@@ -369,7 +370,7 @@ class VLM_STL_Planner(Node):
             rclpy.spin_once(self, timeout_sec=0.1)
         
     def run(self):
-        self.wait_for_odom()
+        # self.wait_for_odom()
         self.wait_for_img()
         self.get_logger().info("Odom message received, starting main loop.")
 
@@ -394,16 +395,19 @@ class VLM_STL_Planner(Node):
 
             else:
                 # TODO: change to reflect new planning loop
-                new_coords, new_vMax = self.find_intermediate_goal_params()
+                time.sleep(1)  # Simulate some processing time
+                
+                # new_coords, new_vMax = self.find_intermediate_goal_params()
 
-                cmd_vel = self.control_law._get_velocity_command(new_coords, k1 = self.settings.m_K1, k2 = self.settings.m_K2, vMax= new_vMax)
-                self.speed.linear.x = cmd_vel.linear.x
-                self.speed.angular.z = cmd_vel.angular.z
+                # cmd_vel = self.control_law._get_velocity_command(new_coords, k1 = self.settings.m_K1, k2 = self.settings.m_K2, vMax= new_vMax)
+                # self.speed.linear.x = cmd_vel.linear.x
+                # self.speed.angular.z = cmd_vel.angular.z
 
             # print("Published velocities (v,w) : ",self.speed.linear.x,self.speed.angular.z)
             self.pub.publish(self.speed)
         else:
             print(" -- Waiting for odom to intialize -- ")
+            time.sleep(1)
 
         loop_end_time = time.time()
         tot_inference_time = loop_end_time - loop_start_time
@@ -605,22 +609,42 @@ class VLM_STL_Planner(Node):
             # Convert the ROS image message to OpenCV format and extract dimensions
             cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='rgb8')
             
+            start_time = time.time()
+            
+            if self.gt_depth_image is not None:
+                self.perception_module.process_image(cv_image, depth_gt=self.gt_depth_image)
+            else:
+                self.perception_module.process_image(cv_image)            
 
             if self.publish_outputs:
+                image_costmap = self.perception_module.get_image_costmap().astype(np.uint8)
+                image_costmap_scaled = (image_costmap * (255.0 / max(self.class_costs))).astype(np.uint8)  # Scale to 0-255
+        
                 # Apply color mapping for visualization and overlay on the original image
-                combined_cost_map_colored = cv2.applyColorMap(combined_cost_map, cv2.COLORMAP_JET)
+                combined_cost_map_colored = cv2.applyColorMap(image_costmap_scaled, cv2.COLORMAP_JET)
+                combined_cost_map_colored = cv2.cvtColor(combined_cost_map_colored, cv2.COLOR_BGR2RGB)  # Convert to RGB for consistency
                 overlaid_image = cv2.addWeighted(cv_image, 0.4, combined_cost_map_colored, 0.6, 0)
+                
+
                 ros_overlaid_image = self.bridge.cv2_to_imgmsg(overlaid_image, encoding='rgb8')
                 self.behav_costmap_publisher.publish(ros_overlaid_image)
 
             # Log the inference time
             end_time2 = time.time()
-            self.get_logger().info(f"CLIPSeg Model Inference Rate: {1/(end_time2 - start_time):.4f} seconds")
+            self.get_logger().info(f"CLIPSeg Model Inference Time: {(end_time2 - start_time):.4f} seconds")
 
             self.received_img_once = True
 
         except Exception as e:
             self.get_logger().error(f"Error processing image: {str(e)}")
+            
+    def depth_image_callback(self, msg):
+        try:
+            # Convert the ROS depth image message to OpenCV format
+            cv_depth_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
+            self.gt_depth_image = cv_depth_image
+        except Exception as e:
+            self.get_logger().error(f"Error processing depth image: {str(e)}")
 
     def occupancy_map_callback(self, msg):
         self.cost_map = msg
