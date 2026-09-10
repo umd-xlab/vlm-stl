@@ -1,5 +1,5 @@
 # This file contains a ROS node implementing our VLM-STL planner
-
+# 08/26 updates now connects odometry, perception, planning, control, and RTA feed output
 # !/usr/bin/env python3
 
 import rclpy
@@ -37,7 +37,10 @@ from threading import Condition, Lock
 
 from utils.odometry_utils import *
 
+# adding imports for shared state/planner
 from perception import PerceptionModule
+from robot_state import Pose2D, RobotState, Velocity2D, observation_from_perception
+from rrt_planner import RRTPlanner
 from utils.image_utils import load_calibration
 import matplotlib.pyplot as plt
 
@@ -358,6 +361,12 @@ class VLM_STL_Planner(Node):
         self.gt_depth_image = None
         self.perception_module = PerceptionModule(self.intrinsic_matrix, self.T_cam_from_base, segmentation_classes=self.prompts, class_costs=self.class_costs,
                                                   segmentation_model = "clipseg", planar_costmap_scale=0.1, logger=self.get_logger())
+        self.robot_state = RobotState() # added these integration objects
+        self.route_planner = RRTPlanner()
+        self.current_observation = None
+        self.rta_feed_path = "feed.csv" #this is what I'm assuming will be fed into the rta
+        self.last_plan_time = 0.0
+        self.plan_period = 1.0
 
     def wait_for_odom(self):
         # Wait for the odom message
@@ -394,15 +403,12 @@ class VLM_STL_Planner(Node):
                 print("--- Goal Reached !! ---")
 
             else:
-                # TODO: change to reflect new planning loop
-                time.sleep(1)  # Simulate some processing time
-                
-                # new_coords, new_vMax = self.find_intermediate_goal_params()
+                # New updates from 08/26 below! (previously had commented out planning code)
+                self.update_route_plan() # call RRTPlanner.plan() and save the returned Route
+                self.update_velocity_from_route() # pick a waypoint from the route, use existing controller to generate a velocity 
 
-                # cmd_vel = self.control_law._get_velocity_command(new_coords, k1 = self.settings.m_K1, k2 = self.settings.m_K2, vMax= new_vMax)
-                # self.speed.linear.x = cmd_vel.linear.x
-                # self.speed.angular.z = cmd_vel.angular.z
-
+            self.robot_state.update_velocity(Velocity2D(self.speed.linear.x, self.speed.angular.z)) # update the velocity back to the RobotState
+            self.append_rta_feed() # adds a new row to rta_feed.csv
             # print("Published velocities (v,w) : ",self.speed.linear.x,self.speed.angular.z)
             self.pub.publish(self.speed)
         else:
@@ -412,6 +418,52 @@ class VLM_STL_Planner(Node):
         loop_end_time = time.time()
         tot_inference_time = loop_end_time - loop_start_time
         print("--- Total inference rate per cycle ---", (1/tot_inference_time))
+
+    def update_route_plan(self):
+        now = time.time()
+        if self.robot_state.current_route is not None and now - self.last_plan_time < self.plan_period:
+            return
+        try:
+            route = self.route_planner.plan(self.robot_state, self.current_observation)
+            self.robot_state.update_route(route)
+            self.last_plan_time = now
+        except ValueError as e:
+            self.get_logger().warn(f"Skipping route plan: {str(e)}")
+        except Exception as e:
+            self.get_logger().error(f"Route planning failed: {str(e)}")
+
+    def update_velocity_from_route(self):
+        route = self.robot_state.current_route
+        if route is None or route.is_empty:
+            self.speed.linear.x = 0.0
+            self.speed.angular.z = 0.0
+            return
+        waypoint = self.next_route_waypoint(route.waypoints)
+        if waypoint is None:
+            self.speed.linear.x = 0.0
+            self.speed.angular.z = 0.0
+            return
+        goal = Pose()
+        goal.position.x = float(waypoint[0])
+        goal.position.y = float(waypoint[1])
+        goal.position.z = 0.0
+        goal.orientation.w = 1.0
+        state = np.array([self.x, self.y, self.th])
+        cmd_vel = self.control_law.get_velocity_command(state, goal, self.settings.m_V_MAX)
+        self.speed.linear.x = cmd_vel.linear.x
+        self.speed.angular.z = cmd_vel.angular.z
+
+    def next_route_waypoint(self, waypoints):
+        for waypoint in waypoints:
+            if math.hypot(waypoint[0] - self.x, waypoint[1] - self.y) > self.WAYPOINT_THRESH:
+                return waypoint
+        return waypoints[-1] if waypoints else None
+
+    def append_rta_feed(self):
+        try:
+            self.robot_state.append_rta_feed(self.rta_feed_path)
+        except Exception as e:
+            self.get_logger().warn(f"Unable to append RTA feed: {str(e)}")
 
     # TODO: Modify to 
     def sim_trajectory(self, r, delta, theta, vMax, time_horizon):
@@ -552,6 +604,7 @@ class VLM_STL_Planner(Node):
         (roll,pitch,theta) = euler_from_quaternion ([rot_q.x,rot_q.y,rot_q.z,rot_q.w]) #uses the code in config class
 
         self.th = theta
+        self.robot_state.update_pose(Pose2D(self.x, self.y, self.th), timestamp=time.time())
 
         if self.received_final_goal_odom:
             self.current_to_goal_dist = np.sqrt((self.goalX - self.x) ** 2 + (self.goalY - self.y) ** 2)
@@ -614,7 +667,10 @@ class VLM_STL_Planner(Node):
             if self.gt_depth_image is not None:
                 self.perception_module.process_image(cv_image, depth_gt=self.gt_depth_image)
             else:
-                self.perception_module.process_image(cv_image)            
+                self.perception_module.process_image(cv_image)
+
+            self.current_observation = observation_from_perception(time.time(), self.perception_module)
+            self.robot_state.update_observation(self.current_observation)
 
             if self.publish_outputs:
                 image_costmap = self.perception_module.get_image_costmap().astype(np.uint8)
@@ -702,6 +758,7 @@ class VLM_STL_Planner(Node):
         pose.orientation.w = quaternion[3]
 
         self.final_goal_pose = pose
+        self.robot_state.update_goal(Pose2D(self.goalX, self.goalY, goal_yaw_odom))
 
         print("Goal x,y w.r.t. robot and odom :", (goalX_rob,goalY_rob),(self.goalX,self.goalY))
 
