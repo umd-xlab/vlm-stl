@@ -226,7 +226,7 @@ class ControlLaw:
 
 class VLM_STL_Planner(Node):
 
-    def __init__(self):
+    def __init__(self, goal_radius=None, goal_theta=None, goal_delta=None):
 
         super().__init__('VLM_STL_planner') 
 
@@ -260,7 +260,7 @@ class VLM_STL_Planner(Node):
         self.sub_odom = self.create_subscription(Odometry, '/odom_lidar', self.assignOdomCoords,self.qos_profile)
         # self.scan_subscriber = self.create_subscription(LaserScan,'/scan', self.scan_callback, self.qos_profile)
 
-        # self.sub_odom = self.create_subscription(Odometry, '/odom', self.assignOdomCoords,self.qos_profile)
+        self.sub_odom = self.create_subscription(Odometry, '/odom', self.assignOdomCoords,self.qos_profile)
         # self.sub_cost_map = self.create_subscription(GridCells, '/costmap_translator/obstacles', self.config.occupancy_map_callback,self.qos_profile)
 
         self.subscription = self.create_subscription(Image,'/camera/color/image_raw', self.image_callback, 10)
@@ -311,9 +311,16 @@ class VLM_STL_Planner(Node):
 
         print("torch.cuda.is_available()",torch.cuda.is_available())
         # Taking three float inputs from the user
-        self.goal_radius = float(input("Enter the goal distance r (meters) : "))
-        self.goal_theta = float(input("Enter the goal heading angle theta (degrees, left +ve) : "))
-        self.goal_delta = float(input("Enter the goal pose angle (degrees) : "))
+        if goal_radius is None:
+            goal_radius = float(input("Enter the goal distance r (meters) : "))
+        if goal_theta is None:
+            goal_theta = float(input("Enter the goal heading angle theta (degrees, left +ve) : "))
+        if goal_delta is None:
+            goal_delta = float(input("Enter the goal pose angle (degrees) : "))
+        
+        self.goal_radius = goal_radius
+        self.goal_theta = goal_theta
+        self.goal_delta = goal_delta
 
         self.velocityGain = 1.0
 
@@ -777,6 +784,8 @@ if __name__ == '__main__':
     arg_parser = argparse.ArgumentParser(description='VLM-STL Planner Node')
     arg_parser.add_argument('--image-path', type=str, default=None, help='Path to an image file for testing')
     arg_parser.add_argument('--save-path', type=str, default=None, help='Path to save the overlaid image')
+    arg_parser.add_argument('--curr-loc', type=float, nargs=2, default=None, help='Current location as two floats (x y)')
+    arg_parser.add_argument('--goal-loc', type=float, nargs=2, default=None, help='Goal location as two floats (x y)')
     args = arg_parser.parse_args()
     
     img_msg = None
@@ -788,12 +797,42 @@ if __name__ == '__main__':
         else:
             img_msg = CvBridge().cv2_to_imgmsg(cv_image, encoding='rgb8')            
 
-    node = VLM_STL_Planner()
-    
+    goal_radius = None
+    goal_theta = None
+    goal_delta = None
+    odom = None
+
+    if args.curr_loc and args.goal_loc:
+        curr_loc = np.array(args.curr_loc)
+        goal_loc = np.array(args.goal_loc)
+        goal_radius = np.linalg.norm(goal_loc - curr_loc)
+        goal_theta = np.degrees(np.arctan2(goal_loc[1] - curr_loc[1], goal_loc[0] - curr_loc[0]))
+        goal_delta = 0.0  # Assuming the robot should face forward at the goal
+        
+        odom = Odometry()
+        odom.pose.pose.position.x = curr_loc[0]
+        odom.pose.pose.position.y = curr_loc[1]
+        odom.pose.pose.position.z = 0.0
+        quaternion = quaternion_from_euler(0, 0, 0)  # Assuming the robot is facing forward initially
+        odom.pose.pose.orientation.x = quaternion[0]
+        odom.pose.pose.orientation.y = quaternion[1]
+        odom.pose.pose.orientation.z = quaternion[2]
+        odom.pose.pose.orientation.w = quaternion[3]
+
+    node = VLM_STL_Planner(goal_radius=goal_radius, goal_theta=goal_theta, goal_delta=goal_delta)
+        
     if img_msg is not None:
         if args.save_path:
             os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
-        node.image_callback(img_msg, save_path=args.save_path)
+        node.image_callback(img_msg, save_path=args.save_path)      
+        
+    if odom is not None:
+        node.assignOdomCoords(odom)
+        
+        node.goal_to_odom_pose()
+        node.received_final_goal_odom = True
+        
+        node.assignOdomCoords(odom)
     
     try:
         node.run()
