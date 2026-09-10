@@ -159,6 +159,8 @@ class Route:
     """
 
     waypoints: list[Waypoint] = field(default_factory=list)
+    # this needs to be updated to include a time parameterization because it is currently just a clone of the waypoints, 
+    # which is not useful for RTA or controller testing
     trajectory: list[Pose2D] = field(default_factory=list)
     costs: dict[str, float] = field(default_factory=dict)
     generated_at: float = field(default_factory=time.time)
