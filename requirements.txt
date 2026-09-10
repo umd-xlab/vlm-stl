@@ -17,3 +17,4 @@ open3d==0.18.0
 pathvalidate==3.3.1
 transformers==4.57.0
 google-genai==2.7.0
+moge @ git+https://github.com/microsoft/MoGe.git@286873bdaa16fe05086ac2e081d6bc87b7523118
