@@ -44,6 +44,8 @@ from rrt_planner import RRTPlanner
 from utils.image_utils import load_calibration
 import matplotlib.pyplot as plt
 
+from offline_demo import build_synthetic_costmap
+
 import argparse
 
 class ControlLawSettings:
@@ -647,27 +649,6 @@ class VLM_STL_Planner(Node):
             self.obstacles_odom = [transform_to_odom(self.x, self.y, self.th, x, y) for x, y in obstacles_cartesian]
         else:
             pass
-
-    # def get_distances_to_obstacles(self, trajectory, obstacles_odom):
-    #     distances_to_obstacles = []
-        
-    #     # Handle case where no obstacles are detected
-    #     if not obstacles_odom:
-    #         self.get_logger().info("No obstacles detected within the sensing range.")
-    #         return [1.0] * len(trajectory)  # Assume all distances are safe, normalized to 1.0
-
-    #     for state in trajectory:
-    #         x, y, _ = state  # Unpack the state
-    #         min_distance = float('inf')
-    #         for obs_x, obs_y in obstacles_odom:
-    #             distance = math.sqrt((obs_x - x) ** 2 + (obs_y - y) ** 2)
-    #             if distance < min_distance:
-    #                 min_distance = distance
-    #         # Normalize by the sensing range
-    #         normalized_distance = min(min_distance / self.sensing_range, 1.0)  # Cap the value at 1.0
-    #         distances_to_obstacles.append(normalized_distance)
-        
-    #     return distances_to_obstacles
     
     def image_callback(self, msg, save_path=None):
         try:
@@ -715,23 +696,6 @@ class VLM_STL_Planner(Node):
             self.gt_depth_image = cv_depth_image
         except Exception as e:
             self.get_logger().error(f"Error processing depth image: {str(e)}")
-
-    def occupancy_map_callback(self, msg):
-        self.cost_map = msg
-        if len(self.cost_map.cells) > 0:
-            points = [(cell.x, cell.y) for cell in self.cost_map.cells]
-            self.obs_tree = KDTree(points)
-            # self.b_has_cost_map = True
-
-    def get_obstacle_distance(self):
-        if not self.b_has_cost_map or not self.b_has_odom:
-            return 0
-        _, min_dist = self.find_nearest_neighbor((self.current_pose.position.x, self.current_pose.position.y))
-        return min_dist
-
-    def find_nearest_neighbor(self, point):
-        dist, idx = self.obs_tree.query(point)
-        return self.cost_map.cells[idx], dist
     
     def convert_to_pose_stamped(self, new_coords):
         # Convert the goal coordinates to a PoseStamped message
@@ -782,11 +746,13 @@ if __name__ == '__main__':
     rclpy.init()
     
     arg_parser = argparse.ArgumentParser(description='VLM-STL Planner Node')
+    arg_parser.add_argument('--synthetic-costmap', action='store_true', help='Use synthetic costmap for testing')
     arg_parser.add_argument('--image-path', type=str, default=None, help='Path to an image file for testing')
     arg_parser.add_argument('--save-path', type=str, default=None, help='Path to save the overlaid image')
     arg_parser.add_argument('--curr-loc', type=float, nargs=2, default=None, help='Current location as two floats (x y)')
     arg_parser.add_argument('--goal-loc', type=float, nargs=2, default=None, help='Goal location as two floats (x y)')
     args = arg_parser.parse_args()
+    
     
     img_msg = None
     
@@ -821,18 +787,22 @@ if __name__ == '__main__':
 
     node = VLM_STL_Planner(goal_radius=goal_radius, goal_theta=goal_theta, goal_delta=goal_delta)
         
-    if img_msg is not None:
+    if img_msg is not None and not args.synthetic_costmap:
         if args.save_path:
             os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
         node.image_callback(img_msg, save_path=args.save_path)      
         
-    if odom is not None:
+    if odom is not None and not args.synthetic_costmap:
         node.assignOdomCoords(odom)
         
         node.goal_to_odom_pose()
         node.received_final_goal_odom = True
         
         node.assignOdomCoords(odom)
+        
+    if args.synthetic_costmap:
+        costmap = build_synthetic_costmap()
+        node.perception_module.assign_test_maps(costmap)
     
     try:
         node.run()

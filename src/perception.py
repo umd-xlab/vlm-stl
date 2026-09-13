@@ -79,6 +79,8 @@ class PerceptionModule:
         # self.prob_thresh = 0.1  # Probability threshold for segmentation masks
         self.cost_values = class_costs  # Cost values for each class in the same order as prompts
         self.image_costmap = None
+        self.ground_plane_cost_map = None
+        self.ground_plane_env_state_map = None
         self.environment_state = None
         self.point_cloud = None
         self.seg_model_name = segmentation_model
@@ -86,6 +88,7 @@ class PerceptionModule:
         
         self.intrinsic_matrix = camera_intrinsic_matrix  # Projection matrix for camera intrinsics
         self.planar_costmap_scale = planar_costmap_scale
+        self.new_costmap = False
         
     def process_image(self, image, segmentation_gt=None, depth_gt=None):
         if segmentation_gt is not None:
@@ -192,6 +195,8 @@ class PerceptionModule:
                 
         # Clip and convert cost map to 8-bit for visualization
         self.image_costmap = combined_cost_map
+        
+        self.new_costmap = True  # Flag to indicate that a new cost map is available
 
         return pred_logits.cpu().numpy() # for use in evaluation work
 
@@ -210,6 +215,12 @@ class PerceptionModule:
         The states are interpolated to fill missing values due to perspective and each value is the closest class to the gound plane at that loation
         The camera/robot is located at the top center of the map, at 0, W/2
         """
+        
+        if self.environment_state is None or self.point_cloud is None:
+            raise ValueError("Environment state or point cloud is not available. Please run process_image() first.")
+        
+        if self.ground_plane_env_state_map is not None and not self.new_costmap:
+            return self.ground_plane_env_state_map  # Return cached environment state map if no new cost map has been generated
 
         # Get the class with the highest probability for each pixel
         class_indices = np.argmax(self.environment_state, axis=2)  # Shape: (H, W)
@@ -238,6 +249,7 @@ class PerceptionModule:
         
         ground_plane_state_map = F.one_hot(torch.from_numpy(ground_plane_state_map.copy()).long(), num_classes=len(self.prompts) + 1).permute(2, 0, 1).numpy()  # Convert back to one-hot encoding for consistency
         
+        self.ground_plane_env_state_map = ground_plane_state_map
         return ground_plane_state_map
     
     def get_top_down_costmap(self):
@@ -247,6 +259,12 @@ class PerceptionModule:
         The costs are interpolated to fill missing values due to perspective
         The camera/robot is located at the top center of the map, at 0, W/2
         """
+        
+        if self.image_costmap is None or self.point_cloud is None:
+            raise ValueError("Cost map or point cloud is not available. Please run process_image() first.")
+        
+        if self.ground_plane_cost_map is not None and not self.new_costmap:
+            return self.ground_plane_cost_map  # Return cached cost map if no new cost map has been generated
 
         # assign cost values to each point in the point cloud
         points_with_cost = np.concatenate((self.point_cloud, self.image_costmap[..., np.newaxis]), axis=-1)
@@ -270,8 +288,9 @@ class PerceptionModule:
         
         # ground_plane_cost_map = np.flip(ground_plane_cost_map, axis=0)  # Flip vertically for visualization
         
+        self.ground_plane_cost_map = ground_plane_cost_map  # Store the ground plane cost map for later use
+        
         return ground_plane_cost_map
-
 
     def get_min_distance_to_classes_aerial(self, p1, p2, range_threshold):
         """
@@ -475,6 +494,17 @@ class PerceptionModule:
             cv2.polylines(marked_img, [points], isClosed=False, color=0, thickness=8)
 
         return marked_img, max_cost, total_cost, points
+    
+    def assign_test_maps(self, costmap, env_state_map=None):
+        """
+        Assigns a test costmap to the perception module for testing purposes.
+        """
+        self.ground_plane_cost_map = costmap.copy()
+        if env_state_map is not None:
+            self.ground_plane_env_state_map = env_state_map.copy()
+        self.image_costmap = costmap.copy()
+        self.point_cloud = np.zeros((self.img_h, self.img_w, 3))  # Dummy point cloud for testing
+        self.new_costmap = False  # did not get this cost map from an images
 
 def single_image_test(intrinsic_matrix, T_base_from_cam, dist, image_path, 
                       segmentation_gt=None, depth_gt=None):
