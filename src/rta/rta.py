@@ -1,7 +1,7 @@
 import multiprocessing
 import time
-from dripper import Dripper
-from booter import Booter
+from rta.dripper import Dripper
+from rta.booter import Booter
 
 class RTA:
     def __init__(self, feed_path, rule_path, robot_states_path = None):
@@ -45,8 +45,8 @@ class RTA:
         At the end, sets the stop event to terminate all threads
 
         """
-        if self.robot_states = None:
-            raise Exception("cannot start offline processing without robot states data")
+        # if self.robot_states == None:
+        #     raise Exception("cannot start offline processing without robot states data")
         try:
             self.stop_event = multiprocessing.Event()
             d = Dripper(self.feed_path, self.robot_states_path, self.stop_event)
