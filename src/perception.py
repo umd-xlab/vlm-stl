@@ -4,12 +4,15 @@ import torch
 import time
 from PIL import Image as PILImage
 import torch.nn.functional as F
+from torchvision import transforms
 import matplotlib.pyplot as plt
 from scipy.interpolate import griddata
 from matplotlib.colors import ListedColormap
 from utils.image_utils import load_calibration, clean_2d, project_clip, draw_polyline, BGR_color_dict
 from utils.image_utils import RGB_color_dict
 from utils.gemini_utils import parse_segmentation_masks
+
+from moge.model.v2 import MoGeModel
 
 import os
 
@@ -23,7 +26,7 @@ import logging
 
 class PerceptionModule:
     def __init__(self, camera_intrinsic_matrix, T_base_from_cam, segmentation_classes, class_costs,
-                 segmentation_model='clipseg', planar_costmap_scale=1, logger=None):
+                 segmentation_model='clipseg', depth_model="depth_anything", planar_costmap_scale=1, logger=None):
         # Set device for model computation
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -58,23 +61,34 @@ class PerceptionModule:
             
         self.base_transform = T_base_from_cam
 
-        # load depth estimation processor and model
-        depth_checkpoint = "depth-anything/Depth-Anything-V2-Metric-Outdoor-Base-hf"
-        self.logger.info(f"... Setting up depth checkpoint {depth_checkpoint}")
-        self.depth_processor = AutoImageProcessor.from_pretrained(depth_checkpoint)
-        self.depth_model = AutoModelForDepthEstimation.from_pretrained(depth_checkpoint).to(self.device)
+        if depth_model == "depth_anything":
+            # load depth estimation processor and model
+            depth_checkpoint = "depth-anything/Depth-Anything-V2-Metric-Outdoor-Base-hf"
+            self.logger.info(f"... Setting up depth checkpoint {depth_checkpoint}")
+            self.depth_processor = AutoImageProcessor.from_pretrained(depth_checkpoint)
+            self.depth_model = AutoModelForDepthEstimation.from_pretrained(depth_checkpoint).to(self.device)
+        elif depth_model == "moge":
+            # load depth estimation processor and model
+            depth_checkpoint = "Ruicheng/moge-2-vitb-normal"
+            self.logger.info(f"... Setting up depth checkpoint {depth_checkpoint}")
+            self.depth_processor = transforms.ToTensor()
+            self.depth_model = MoGeModel.from_pretrained(depth_checkpoint).to(self.device)
 
         self.logger.info(f"depth_model loaded, prompts: {self.prompts}")
 
         # self.prob_thresh = 0.1  # Probability threshold for segmentation masks
         self.cost_values = class_costs  # Cost values for each class in the same order as prompts
         self.image_costmap = None
+        self.ground_plane_cost_map = None
+        self.ground_plane_env_state_map = None
         self.environment_state = None
         self.point_cloud = None
         self.seg_model_name = segmentation_model
+        self.depth_model_name = depth_model
         
         self.intrinsic_matrix = camera_intrinsic_matrix  # Projection matrix for camera intrinsics
         self.planar_costmap_scale = planar_costmap_scale
+        self.new_costmap = False
         
     def process_image(self, image, segmentation_gt=None, depth_gt=None):
         if segmentation_gt is not None:
@@ -88,7 +102,10 @@ class PerceptionModule:
         elif self.seg_model_name == 'clipseg':
             seg_inputs = self.seg_processor(text=self.prompts, images=[pil_image] * len(self.prompts), padding=True, return_tensors="pt").to(self.device)
             
-        depth_inputs = self.depth_processor(images=pil_image, return_tensors="pt").pixel_values.to(self.device)
+        if self.depth_model_name == "moge":
+            depth_inputs = self.depth_processor(pil_image).to(self.device)
+        elif self.depth_model_name == "depth_anything":
+            depth_inputs = self.depth_processor(images=pil_image, return_tensors="pt").pixel_values.to(self.device)
 
         # Perform model inference
         self.logger.info("Running Inference...")
@@ -137,10 +154,16 @@ class PerceptionModule:
             pred_logits = preds_resized.float()  # Use one-hot encoded ground truth as "logits" for consistency in cost map generation
         
         if depth_gt is None:
-            with torch.no_grad():
-                depth_outputs = self.depth_model(depth_inputs)
-            output_depth = depth_outputs.predicted_depth
-            depth_map = F.interpolate(output_depth.unsqueeze(0), size=(self.img_h, self.img_w), mode="bilinear", align_corners=False).squeeze().cpu().numpy()
+            if self.depth_model_name == "depth_anything":
+                with torch.no_grad():
+                    depth_outputs = self.depth_model(depth_inputs)
+                output_depth = depth_outputs.predicted_depth
+                depth_map = F.interpolate(output_depth.unsqueeze(0), size=(self.img_h, self.img_w), mode="bilinear", align_corners=False).squeeze().cpu().numpy()
+            elif self.depth_model_name == "moge":
+                with torch.no_grad():
+                    depth_outputs = self.depth_model.infer(depth_inputs)
+                
+                depth_map = depth_outputs['depth'].squeeze().cpu().numpy()
         else:
             depth_map = depth_gt.astype(np.float32)
         
@@ -172,6 +195,8 @@ class PerceptionModule:
                 
         # Clip and convert cost map to 8-bit for visualization
         self.image_costmap = combined_cost_map
+        
+        self.new_costmap = True  # Flag to indicate that a new cost map is available
 
         return pred_logits.cpu().numpy() # for use in evaluation work
 
@@ -190,6 +215,12 @@ class PerceptionModule:
         The states are interpolated to fill missing values due to perspective and each value is the closest class to the gound plane at that loation
         The camera/robot is located at the top center of the map, at 0, W/2
         """
+        
+        if self.environment_state is None or self.point_cloud is None:
+            raise ValueError("Environment state or point cloud is not available. Please run process_image() first.")
+        
+        if self.ground_plane_env_state_map is not None and not self.new_costmap:
+            return self.ground_plane_env_state_map  # Return cached environment state map if no new cost map has been generated
 
         # Get the class with the highest probability for each pixel
         class_indices = np.argmax(self.environment_state, axis=2)  # Shape: (H, W)
@@ -218,6 +249,7 @@ class PerceptionModule:
         
         ground_plane_state_map = F.one_hot(torch.from_numpy(ground_plane_state_map.copy()).long(), num_classes=len(self.prompts) + 1).permute(2, 0, 1).numpy()  # Convert back to one-hot encoding for consistency
         
+        self.ground_plane_env_state_map = ground_plane_state_map
         return ground_plane_state_map
     
     def get_top_down_costmap(self):
@@ -227,6 +259,12 @@ class PerceptionModule:
         The costs are interpolated to fill missing values due to perspective
         The camera/robot is located at the top center of the map, at 0, W/2
         """
+        
+        if self.image_costmap is None or self.point_cloud is None:
+            raise ValueError("Cost map or point cloud is not available. Please run process_image() first.")
+        
+        if self.ground_plane_cost_map is not None and not self.new_costmap:
+            return self.ground_plane_cost_map  # Return cached cost map if no new cost map has been generated
 
         # assign cost values to each point in the point cloud
         points_with_cost = np.concatenate((self.point_cloud, self.image_costmap[..., np.newaxis]), axis=-1)
@@ -250,8 +288,9 @@ class PerceptionModule:
         
         # ground_plane_cost_map = np.flip(ground_plane_cost_map, axis=0)  # Flip vertically for visualization
         
+        self.ground_plane_cost_map = ground_plane_cost_map  # Store the ground plane cost map for later use
+        
         return ground_plane_cost_map
-
 
     def get_min_distance_to_classes_aerial(self, p1, p2, range_threshold):
         """
@@ -372,7 +411,10 @@ class PerceptionModule:
                     # will be removed if rejection vector method is faster
                     rejection_vector = closest_point - np.dot(closest_point, vector_traversed) / np.dot(vector_traversed, vector_traversed) * vector_traversed
                     
-                    safe_point = closest_point - rejection_vector * (range_threshold / np.linalg.norm(rejection_vector))
+                    if np.linalg.norm(rejection_vector) == 0:
+                        safe_point = vector_traversed
+                    else:
+                        safe_point = closest_point - rejection_vector * (range_threshold / np.linalg.norm(rejection_vector))
                     safest_points.append(safe_point + p1)  # Transform back to global coordinates
                 else:
                     safest_points.append(None)
@@ -452,6 +494,17 @@ class PerceptionModule:
             cv2.polylines(marked_img, [points], isClosed=False, color=0, thickness=8)
 
         return marked_img, max_cost, total_cost, points
+    
+    def assign_test_maps(self, costmap, env_state_map=None):
+        """
+        Assigns a test costmap to the perception module for testing purposes.
+        """
+        self.ground_plane_cost_map = costmap.copy()
+        if env_state_map is not None:
+            self.ground_plane_env_state_map = env_state_map.copy()
+        self.image_costmap = costmap.copy()
+        self.point_cloud = np.zeros((self.img_h, self.img_w, 3))  # Dummy point cloud for testing
+        self.new_costmap = False  # did not get this cost map from an images
 
 def single_image_test(intrinsic_matrix, T_base_from_cam, dist, image_path, 
                       segmentation_gt=None, depth_gt=None):
@@ -488,7 +541,8 @@ def single_image_test(intrinsic_matrix, T_base_from_cam, dist, image_path,
     class_costs = [1, 5, 20, 20, 10]
 
     # get predicted cost map and environment state from the perception module
-    pred_perception_module = PerceptionModule(intrinsic_matrix, T_base_from_cam, classes, class_costs, segmentation_model='clipseg')
+    pred_perception_module = PerceptionModule(intrinsic_matrix, T_base_from_cam, classes, class_costs, 
+                                              segmentation_model='clipseg', depth_model="moge")
     # print(f"Perception Module setup time: {time.time() - setup_start_time:.2f} seconds")
     pred_logits = pred_perception_module.process_image(image)
 

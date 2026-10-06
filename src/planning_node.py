@@ -44,6 +44,10 @@ from rrt_planner import RRTPlanner
 from utils.image_utils import load_calibration
 import matplotlib.pyplot as plt
 
+from offline_demo import build_synthetic_costmap
+
+import argparse
+
 class ControlLawSettings:
     # (self, K1=1.2, K2=1, BETA=0.4, LAMBDA=2, V_MAX=0.8, V_MIN=0.0, R_THRESH=0.05):
     def __init__(self, K1=1, K2=3, BETA=1, LAMBDA=1, V_MAX=1.0, V_MIN=0.0, R_THRESH=0.05):
@@ -224,7 +228,7 @@ class ControlLaw:
 
 class VLM_STL_Planner(Node):
 
-    def __init__(self):
+    def __init__(self, goal_radius=None, goal_theta=None, goal_delta=None):
 
         super().__init__('VLM_STL_planner') 
 
@@ -258,7 +262,7 @@ class VLM_STL_Planner(Node):
         self.sub_odom = self.create_subscription(Odometry, '/odom_lidar', self.assignOdomCoords,self.qos_profile)
         # self.scan_subscriber = self.create_subscription(LaserScan,'/scan', self.scan_callback, self.qos_profile)
 
-        # self.sub_odom = self.create_subscription(Odometry, '/odom', self.assignOdomCoords,self.qos_profile)
+        self.sub_odom = self.create_subscription(Odometry, '/odom', self.assignOdomCoords,self.qos_profile)
         # self.sub_cost_map = self.create_subscription(GridCells, '/costmap_translator/obstacles', self.config.occupancy_map_callback,self.qos_profile)
 
         self.subscription = self.create_subscription(Image,'/camera/color/image_raw', self.image_callback, 10)
@@ -309,9 +313,16 @@ class VLM_STL_Planner(Node):
 
         print("torch.cuda.is_available()",torch.cuda.is_available())
         # Taking three float inputs from the user
-        self.goal_radius = float(input("Enter the goal distance r (meters) : "))
-        self.goal_theta = float(input("Enter the goal heading angle theta (degrees, left +ve) : "))
-        self.goal_delta = float(input("Enter the goal pose angle (degrees) : "))
+        if goal_radius is None:
+            goal_radius = float(input("Enter the goal distance r (meters) : "))
+        if goal_theta is None:
+            goal_theta = float(input("Enter the goal heading angle theta (degrees, left +ve) : "))
+        if goal_delta is None:
+            goal_delta = float(input("Enter the goal pose angle (degrees) : "))
+        
+        self.goal_radius = goal_radius
+        self.goal_theta = goal_theta
+        self.goal_delta = goal_delta
 
         self.velocityGain = 1.0
 
@@ -638,29 +649,8 @@ class VLM_STL_Planner(Node):
             self.obstacles_odom = [transform_to_odom(self.x, self.y, self.th, x, y) for x, y in obstacles_cartesian]
         else:
             pass
-
-    # def get_distances_to_obstacles(self, trajectory, obstacles_odom):
-    #     distances_to_obstacles = []
-        
-    #     # Handle case where no obstacles are detected
-    #     if not obstacles_odom:
-    #         self.get_logger().info("No obstacles detected within the sensing range.")
-    #         return [1.0] * len(trajectory)  # Assume all distances are safe, normalized to 1.0
-
-    #     for state in trajectory:
-    #         x, y, _ = state  # Unpack the state
-    #         min_distance = float('inf')
-    #         for obs_x, obs_y in obstacles_odom:
-    #             distance = math.sqrt((obs_x - x) ** 2 + (obs_y - y) ** 2)
-    #             if distance < min_distance:
-    #                 min_distance = distance
-    #         # Normalize by the sensing range
-    #         normalized_distance = min(min_distance / self.sensing_range, 1.0)  # Cap the value at 1.0
-    #         distances_to_obstacles.append(normalized_distance)
-        
-    #     return distances_to_obstacles
     
-    def image_callback(self, msg):
+    def image_callback(self, msg, save_path=None):
         try:
             # Convert the ROS image message to OpenCV format and extract dimensions
             cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='rgb8')
@@ -683,7 +673,9 @@ class VLM_STL_Planner(Node):
                 combined_cost_map_colored = cv2.applyColorMap(image_costmap_scaled, cv2.COLORMAP_JET)
                 combined_cost_map_colored = cv2.cvtColor(combined_cost_map_colored, cv2.COLOR_BGR2RGB)  # Convert to RGB for consistency
                 overlaid_image = cv2.addWeighted(cv_image, 0.4, combined_cost_map_colored, 0.6, 0)
-                
+
+                if save_path:
+                    cv2.imwrite(save_path, cv2.cvtColor(overlaid_image, cv2.COLOR_RGB2BGR))
 
                 ros_overlaid_image = self.bridge.cv2_to_imgmsg(overlaid_image, encoding='rgb8')
                 self.behav_costmap_publisher.publish(ros_overlaid_image)
@@ -704,23 +696,6 @@ class VLM_STL_Planner(Node):
             self.gt_depth_image = cv_depth_image
         except Exception as e:
             self.get_logger().error(f"Error processing depth image: {str(e)}")
-
-    def occupancy_map_callback(self, msg):
-        self.cost_map = msg
-        if len(self.cost_map.cells) > 0:
-            points = [(cell.x, cell.y) for cell in self.cost_map.cells]
-            self.obs_tree = KDTree(points)
-            # self.b_has_cost_map = True
-
-    def get_obstacle_distance(self):
-        if not self.b_has_cost_map or not self.b_has_odom:
-            return 0
-        _, min_dist = self.find_nearest_neighbor((self.current_pose.position.x, self.current_pose.position.y))
-        return min_dist
-
-    def find_nearest_neighbor(self, point):
-        dist, idx = self.obs_tree.query(point)
-        return self.cost_map.cells[idx], dist
     
     def convert_to_pose_stamped(self, new_coords):
         # Convert the goal coordinates to a PoseStamped message
@@ -769,8 +744,65 @@ class VLM_STL_Planner(Node):
 if __name__ == '__main__':
     
     rclpy.init()
+    
+    arg_parser = argparse.ArgumentParser(description='VLM-STL Planner Node')
+    arg_parser.add_argument('--synthetic-costmap', action='store_true', help='Use synthetic costmap for testing')
+    arg_parser.add_argument('--image-path', type=str, default=None, help='Path to an image file for testing')
+    arg_parser.add_argument('--save-path', type=str, default=None, help='Path to save the overlaid image')
+    arg_parser.add_argument('--curr-loc', type=float, nargs=2, default=None, help='Current location as two floats (x y)')
+    arg_parser.add_argument('--goal-loc', type=float, nargs=2, default=None, help='Goal location as two floats (x y)')
+    args = arg_parser.parse_args()
+    
+    
+    img_msg = None
+    
+    if args.image_path:
+        cv_image = cv2.imread(args.image_path)
+        if cv_image is None:
+            raise FileNotFoundError(f"Error: Could not read image from {args.image_path}") 
+        else:
+            img_msg = CvBridge().cv2_to_imgmsg(cv_image, encoding='rgb8')            
 
-    node = VLM_STL_Planner()
+    goal_radius = None
+    goal_theta = None
+    goal_delta = None
+    odom = None
+
+    if args.curr_loc and args.goal_loc:
+        curr_loc = np.array(args.curr_loc)
+        goal_loc = np.array(args.goal_loc)
+        goal_radius = np.linalg.norm(goal_loc - curr_loc)
+        goal_theta = np.degrees(np.arctan2(goal_loc[1] - curr_loc[1], goal_loc[0] - curr_loc[0]))
+        goal_delta = 0.0  # Assuming the robot should face forward at the goal
+        
+        odom = Odometry()
+        odom.pose.pose.position.x = curr_loc[0]
+        odom.pose.pose.position.y = curr_loc[1]
+        odom.pose.pose.position.z = 0.0
+        quaternion = quaternion_from_euler(0, 0, 0)  # Assuming the robot is facing forward initially
+        odom.pose.pose.orientation.x = quaternion[0]
+        odom.pose.pose.orientation.y = quaternion[1]
+        odom.pose.pose.orientation.z = quaternion[2]
+        odom.pose.pose.orientation.w = quaternion[3]
+
+    node = VLM_STL_Planner(goal_radius=goal_radius, goal_theta=goal_theta, goal_delta=goal_delta)
+        
+    if img_msg is not None and not args.synthetic_costmap:
+        if args.save_path:
+            os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
+        node.image_callback(img_msg, save_path=args.save_path)      
+        
+    if odom is not None and not args.synthetic_costmap:
+        node.assignOdomCoords(odom)
+        
+        node.goal_to_odom_pose()
+        node.received_final_goal_odom = True
+        
+        node.assignOdomCoords(odom)
+        
+    if args.synthetic_costmap:
+        costmap = build_synthetic_costmap()
+        node.perception_module.assign_test_maps(costmap)
     
     try:
         node.run()
