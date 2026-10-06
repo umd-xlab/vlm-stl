@@ -6,6 +6,7 @@ import argparse
 import json
 from pathlib import Path
 import sys
+import csv
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -13,6 +14,8 @@ import numpy as np
 try:
     from robot_state import Observation, Pose2D, RobotState
     from rrt_planner import PlannerResult, PlannerSettings, PlannerStatus, RRTPlanner
+    from rta.preprocessing import Preprocessor
+    from rta.rta import RTA
 except ImportError:
     from .robot_state import Observation, Pose2D, RobotState
     from .rrt_planner import PlannerResult, PlannerSettings, PlannerStatus, RRTPlanner
@@ -135,6 +138,12 @@ def run_demo(output_dir: str | Path = "src/output") -> tuple[RobotState, Planner
         robot_state.update_route(result.route)
         _validate_route(result, costmap)
         route_trace = robot_state.get_current_route_trace()
+        #RTA addition
+        p = Preprocessor(route_trace, "./rta/rules.csv", "./rta/robot_states.csv")
+        p.process_dist_rule(5,20)
+        rta = RTA("./rta/feed.csv", "./rta/rules.csv", "./rta/robot_states.csv")
+        rta.start_offline()
+        
     else:
         route_trace = None
 
@@ -161,7 +170,13 @@ def run_demo(output_dir: str | Path = "src/output") -> tuple[RobotState, Planner
     print(f"frame ID: {result.frame_id}; position units: {result.position_units}; time units: {result.time_units}")
     print(f"map version: {result.map_version}; RobotState.route identity and data consistent: {route_consistent}")
     print(f"trace artifact: {trace_path}; plot artifact: {plot_path}")
-    print("RTA evaluation not run: planner-only synthetic-map sanity check.")
+    print(f"RTA")
+    # print("RTA evaluation not run: planner-only synthetic-map sanity check.")
+    with open("./rta/logs/failure_log.csv", "r") as f:
+        reader = csv.reader(f)
+        row_count = sum(1 for row in reader)
+        print("safe" if row_count == 1 else "violated")
+    
     return robot_state, result, trace_path, plot_path
 
 

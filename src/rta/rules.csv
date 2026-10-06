@@ -1,4 +1,2 @@
 rule,input,output
-'out = (spd < 5);',,spd
-'out = (dst > 1);',,dst
-'out = ((srf < 0) implies eventually[0:5] (srf > 0));',,srf
+'out = (dst > 5);',,dst

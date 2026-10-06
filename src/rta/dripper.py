@@ -36,7 +36,8 @@ class Dripper:
                 for line in csvFile:
                     writer.writerow(line)
                     f.flush()
-                    time.sleep(1) #Can be very low value (units are in seconds) to increase speed of evaluation
+                    # time.sleep(1) #Can be very low value (units are in seconds) to increase speed of evaluation
+                    time.sleep(0.1)
         self.stop_event.set()
 
         return True

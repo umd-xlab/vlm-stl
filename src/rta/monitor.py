@@ -1,6 +1,7 @@
 import time
 import pandas as pd
 import rtamt
+import os
 import csv
 import multiprocessing
 import matplotlib
@@ -191,7 +192,11 @@ class Monitor:
         plt.tight_layout()
         #Saves the graph name based on rule, uses 3rd party library for text cleaning: https://www.tradingcode.net/python/sanitise-clean-filename/
         clean_name = sanitize_filename(self.rule, replacement_text="_")
-        self.fig.savefig(f"plots/{clean_name}.png")
+
+        logs_dir = os.path.dirname(self.data_dump_log)
+        plot_dir = os.path.join(logs_dir, "plots")
+        os.makedirs(plot_dir, exist_ok=True)
+        self.fig.savefig(os.path.join(plot_dir, f"{clean_name}.png") )
 
     def start_overseer(self):
         """
@@ -221,7 +226,8 @@ class Monitor:
         #Counts the number of lines in the csv, used to determine if an update actually occurred
         def count_lines():
             total=0
-            with open('feed.csv', 'r') as f:
+            # with open('feed.csv', 'r') as f:
+            with open(self.feed_path, 'r') as f:
                 for line in f:
                     total+=1
             return total
@@ -233,7 +239,7 @@ class Monitor:
         #Instnatiates the observer and starts a new thread for it
         #Waits for stop_event to be triggered, then shutsdown
         observer = Observer()
-        observer.schedule(event_handler, path=".", recursive=False)
+        observer.schedule(event_handler, path=self.feed_path, recursive=False)
         observer.start()
 
         self.stop_event.wait()

@@ -1,6 +1,6 @@
 import multiprocessing
 import csv
-from monitor import Monitor
+from rta.monitor import Monitor
 import multiprocessing
 
 class Booter:
@@ -18,8 +18,8 @@ class Booter:
         self.feed_path = feed_path
         self.rule_path = rule_path
         self.stop_event = stop_event
-        self.failure_log = "./logs/failure_log.csv"
-        self.data_dump_log = "./logs/data_dump_log.csv"
+        self.failure_log = "./rta/logs/failure_log.csv"
+        self.data_dump_log = "./rta/logs/data_dump_log.csv"
 
         self.instantiate_log_files()
 
