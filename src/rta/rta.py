@@ -1,23 +1,25 @@
-import multiprocessing
-import time
+import threading
+
 from rta.dripper import Dripper
 from rta.booter import Booter
+from rta.state_data import StateFeed
+from rta.logger import RTALogger
 
 class RTA:
-    def __init__(self, feed_path, rule_path, robot_states_path = None):
+    def __init__(self, config, robot_states=None):
         """
         Master class used to conduct runtime assurance (rta)
 
-        feed_path - (string) file path to where the robot state data will come in
-        rule_path - (string) file path to all stl logic rules to be instantiated
-        robot_states_path - (string) OPTIONAL, file path, to be used for offline evaluation. Contains full trace of robot states
-        stop_event - internal variable, used for parallel processing, passed through to all classes
+        config - RTAConfig containing evaluation settings
+        robot_states - optional StateData containing the complete preprocessed trajectory
+        stop_event - internal variable, used for threading, signal to stop running
 
         """
-        self.feed_path = feed_path
-        self.rule_path = rule_path
-        self.robot_states_path = robot_states_path
+        self.config = config
+        self.robot_states = robot_states
         self.stop_event = None
+        self.feed = None
+        self.booter = None
 
     def start_online(self):
         """
@@ -28,44 +30,80 @@ class RTA:
         At the end, sets the stop event to terminate all threads
 
         """
-        try:
-            self.stop_event = multiprocessing.Event()
-            b = Booter(self.feed_path, self.rule_path, self.stop_event)
-            b.start()
-        finally:
-            self.stop_event.set()
+        raise NotImplementedError("Online Mode has not yet been created")
 
     def start_offline(self):
         """
         Offline Evaluation Mode
 
-        "Fakes online" by using Dripper class to rapidly feed full trace data in robot_states_path
-        Creates and starts the booter.
-        Links the processes together so they terminate when the Dripper class is done sending robot_states_path data
-        At the end, sets the stop event to terminate all threads
+        Creates a shared state feed.
+        Starts the Booter and the Dripper in separate threads
+        and waits for both to finish
 
+        Exceptions in worker threads are propogated back to calling thread
         """
-        # if self.robot_states == None:
-        #     raise Exception("cannot start offline processing without robot states data")
+        self.stop_event = threading.Event()
+        self.feed = StateFeed()
+        d = Dripper(self.feed, self.robot_states, self.stop_event)
+        self.booter = Booter(self.feed, self.config.stl_rule_file, self.stop_event, self.config)
+
+        errors = []
+        error_lock = threading.Lock()
+
+        def run_worker(target):
+            try:
+                target()
+            except BaseException as e:
+                with error_lock:
+                    errors.append(e)
+
+                self.stop_event.set()
+                self.feed.finish()
+
+        p1 = threading.Thread(target=lambda: run_worker(d.start))
+        p2 = threading.Thread(target=lambda: run_worker(self.booter.start))
+
         try:
-            self.stop_event = multiprocessing.Event()
-            d = Dripper(self.feed_path, self.robot_states_path, self.stop_event)
-            b = Booter(self.feed_path, self.rule_path, self.stop_event)
-            p1 = multiprocessing.Process(target = d.start)
-            p2 = multiprocessing.Process(target = b.start)
-            p1.start()
             p2.start()
-            self.stop_event.wait()
+            p1.start()
             p1.join()
             p2.join()
+
+            if errors:
+                raise RuntimeError("Offline RTA evaluation failed") from errors[0]
+
+            if self.config.enable_logging:
+                if not self.config.logging_output_folder:
+                    raise ValueError("logging_output folder must be configured when logging is enabled, else set to false")
+                logger = RTALogger(self.config.logging_output_folder)
+                logger.export(self.booter.monitors)
         finally:
             self.stop_event.set()
 
-if __name__ == "__main__":
-    """
-    Sample setup to be run with 'python rta.py' from terminal
+    def get_failures(self):
+        """
+        Returns violations collected from all monitors.
+        """
 
-    """
-    r = RTA('feed.csv', 'rules.csv', robot_states_path='robot_states.csv')
-    r.start_offline()
-    print("finished")
+        if self.booter is None:
+            return []
+
+        failures = []
+        for monitor in self.booter.monitors:
+            failures.extend(monitor.failures)
+
+        return sorted(failures, key=lambda result: result["time"])
+
+    def get_robustness_results(self):
+        """
+        Returns all robustness results from all monitors
+        """
+        if self.booter is None:
+            return []
+
+        results = []
+
+        for monitor in self.booter.monitors:
+            results.extend(monitor.robustness_results)
+
+        return sorted(results, key=lambda result: result["time"])

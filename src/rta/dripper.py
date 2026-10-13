@@ -1,43 +1,40 @@
-import csv
 import time
 
+from rta.state_data import StateData, StateFeed
+
 class Dripper:
-    def __init__(self, feed_path, robot_states_path, stop_event):
+    def __init__(self, feed: StateFeed, robot_states: StateData, stop_event):
         """
-        Called from rta.py, used to help "fake online" mode in offline evaluation
+        Called from rta.py, used to help "fake online" mode in offline evaluation for propper robustness identification
 
-        feed_path - (string) file path to where the dripper will send the robot state data
-        robot_states_path - (string), contains full trace of robot states, will be rapidly fed into the file located at feed_path
-        stop_event - internal variable, used for parallel processing, passed through to all classes
+        feed - shared in-memory feed for robot states
+        robot_states - complete trajectory with prepreocessed rule variables
+        stop_event - internal variable, used for threading, signal to stop running
 
         """
-        self.feed_path = feed_path
-        self.robot_states_path = robot_states_path
+        self.feed = feed
+        self.robot_states = robot_states
         self.stop_event = stop_event
 
     def start(self):
         """
+        Published each preprocessed robot state into the shared feed (StateFeed)
+        one observation at a time
 
-        If robot_states_path managed to be none, nothing to process therefore sends termination signal
-        Opens robot_states_path (which should be csv) and rapidly sends it over line by line into the feed_path
-        Speed for debugging can be adjusted on line 37 with time.sleep()
-        Sends the stop_event for threads to all linked classes once complete
-
+        Signals feed compeltion after all states have been published
         """
-        if self.robot_states_path == None:
-            self.stop_event.set()
-            return True
-        with open(self.robot_states_path, mode='r') as file:
-            csvFile = csv.reader(file)
-            with open (self.feed_path, mode='w'
-                #'a'
-                ) as f:
-                writer = csv.writer(f)
-                for line in csvFile:
-                    writer.writerow(line)
-                    f.flush()
-                    # time.sleep(1) #Can be very low value (units are in seconds) to increase speed of evaluation
-                    time.sleep(0.1)
-        self.stop_event.set()
+        try: 
+            if self.robot_states is None:
+                return True
 
-        return True
+            for state in self.robot_states.states:
+                if self.stop_event.is_set():
+                    break
+
+                self.feed.append(state)
+
+                #Optional delay for debugging
+                time.sleep(0.1)
+            return True
+        finally:
+            self.feed.finish()
