@@ -8,9 +8,14 @@ from torchvision import transforms
 import matplotlib.pyplot as plt
 from scipy.interpolate import griddata
 from matplotlib.colors import ListedColormap
-from utils.image_utils import load_calibration, clean_2d, project_clip, draw_polyline, BGR_color_dict
-from utils.image_utils import RGB_color_dict
-from utils.gemini_utils import parse_segmentation_masks
+try:
+    from utils.image_utils import load_calibration, clean_2d, project_clip, draw_polyline, BGR_color_dict
+    from utils.image_utils import RGB_color_dict
+    from utils.gemini_utils import parse_segmentation_masks
+except ImportError:
+    from .utils.image_utils import load_calibration, clean_2d, project_clip, draw_polyline, BGR_color_dict
+    from .utils.image_utils import RGB_color_dict
+    from .utils.gemini_utils import parse_segmentation_masks
 
 from moge.model.v2 import MoGeModel
 
@@ -89,6 +94,22 @@ class PerceptionModule:
         self.intrinsic_matrix = camera_intrinsic_matrix  # Projection matrix for camera intrinsics
         self.planar_costmap_scale = planar_costmap_scale
         self.new_costmap = False
+
+    @classmethod
+    def test_instance(cls, segmentation_classes, class_costs):
+        """Create a model-free instance for synthetic costmap integration tests."""
+        instance = cls.__new__(cls)
+        instance.prompts = list(segmentation_classes)
+        instance.cost_values = list(class_costs)
+        instance.image_costmap = None
+        instance.ground_plane_cost_map = None
+        instance.ground_plane_env_state_map = None
+        instance.environment_state = None
+        instance.point_cloud = None
+        instance.img_h = None
+        instance.img_w = None
+        instance.new_costmap = False
+        return instance
         
     def process_image(self, image, segmentation_gt=None, depth_gt=None):
         if segmentation_gt is not None:
@@ -499,11 +520,21 @@ class PerceptionModule:
         """
         Assigns a test costmap to the perception module for testing purposes.
         """
+        costmap = np.asarray(costmap, dtype=np.float64)
+        if costmap.ndim != 2:
+            raise ValueError("Synthetic costmap must be a 2D array")
+        env_h, env_w = costmap.shape
+        
         self.ground_plane_cost_map = costmap.copy()
         if env_state_map is not None:
             self.ground_plane_env_state_map = env_state_map.copy()
         self.image_costmap = costmap.copy()
-        self.point_cloud = np.zeros((self.img_h, self.img_w, 3))  # Dummy point cloud for testing
+        self.point_cloud = np.zeros((env_h, env_w, 3))  # Dummy point cloud for testing
+        if env_state_map is None:
+            self.environment_state = np.zeros((env_h, env_w, len(self.prompts) + 1), dtype=np.int8)
+            self.environment_state[:, :, 0] = 1
+        else:
+            self.environment_state = np.asarray(env_state_map).copy()
         self.new_costmap = False  # did not get this cost map from an images
 
 def single_image_test(intrinsic_matrix, T_base_from_cam, dist, image_path, 

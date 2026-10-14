@@ -10,7 +10,7 @@ from src.offline_demo import (
     SEED,
     START,
     build_demo_state,
-    build_synthetic_costmap,
+    get_synthetic_costmap,
     GridCostmap,
 )
 from src.rrt_planner import PlannerSettings, PlannerStatus, RRTPlanner

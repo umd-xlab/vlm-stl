@@ -12,58 +12,43 @@ import os
 
 import cv2
 from cv_bridge import CvBridge, CvBridgeError
-# from matplotlib import pyplot as plt
 
-# Message types
-from std_msgs.msg import Float32, Float32MultiArray, UInt32
-from geometry_msgs.msg import Twist, PointStamped,Point, PoseArray, PoseStamped, Quaternion, Pose
+from geometry_msgs.msg import Twist, PointStamped, Point, PoseArray, PoseStamped, Quaternion, Pose
 from nav_msgs.msg import OccupancyGrid, Odometry, GridCells
-from sensor_msgs.msg import LaserScan, CompressedImage, NavSatFix
-from sensor_msgs.msg import Image
-from cv_bridge import CvBridge
+from sensor_msgs.msg import LaserScan, CompressedImage, NavSatFix, Image
 import torch
-# import nevergrad as ng
 
 import copy
 import time
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 
-# import utm
-
 from concurrent.futures import ProcessPoolExecutor
 from scipy.spatial import KDTree
 from threading import Condition, Lock
 
-from utils.odometry_utils import *
-
-# adding imports for shared state/planner
-from perception import PerceptionModule
-from robot_state import Pose2D, RobotState, Velocity2D, observation_from_perception
-from rrt_planner import RRTPlanner
-from utils.image_utils import load_calibration
+try:
+    from utils.odometry_utils import *
+    from perception import PerceptionModule
+    from robot_state import Pose2D, RobotState, Velocity2D, observation_from_perception
+    from rrt_planner import RRTPlanner
+    from utils.image_utils import load_calibration
+except ImportError:
+    from .utils.odometry_utils import *
+    from .perception import PerceptionModule
+    from .robot_state import Pose2D, RobotState, Velocity2D, observation_from_perception
+    from .rrt_planner import RRTPlanner
+    from .utils.image_utils import load_calibration
 import matplotlib.pyplot as plt
 
-from offline_demo import build_synthetic_costmap
+try:
+    from offline_demo import get_synthetic_costmap
+    from planner_config import load_planner_config
+except ImportError:
+    from .offline_demo import get_synthetic_costmap
+    from .planner_config import load_planner_config
 
 import argparse
-
-class ControlLawSettings:
-    # (self, K1=1.2, K2=1, BETA=0.4, LAMBDA=2, V_MAX=0.8, V_MIN=0.0, R_THRESH=0.05):
-    def __init__(self, K1=1, K2=3, BETA=1, LAMBDA=1, V_MAX=1.0, V_MIN=0.0, R_THRESH=0.05):
-        self.m_K1 = K1
-        self.m_K2 = K2
-        self.m_BETA = BETA
-        self.m_LAMBDA = LAMBDA
-        self.m_V_MAX = V_MAX
-        self.m_V_MIN = V_MIN
-        self.m_R_THRESH = R_THRESH
-
-class EgoPolar:
-    def __init__(self, r=0.0, delta=0.0, theta=0.0):
-        self.r = r
-        self.delta = delta
-        self.theta = theta
 
 class ControlLaw:
     def __init__(self, settings=ControlLawSettings()):
@@ -228,9 +213,13 @@ class ControlLaw:
 
 class VLM_STL_Planner(Node):
 
-    def __init__(self, goal_radius=None, goal_theta=None, goal_delta=None):
+    def __init__(self, config=None, offline=False, goal_radius=None, goal_theta=None, goal_delta=None):
 
         super().__init__('VLM_STL_planner') 
+
+        config = config or load_planner_config()
+        planning_config = config["planning_node"]
+        perception_config = config["perception_node"]
 
         self.qos_profile  = QoSProfile(
                                         reliability=QoSReliabilityPolicy.BEST_EFFORT,
@@ -271,11 +260,8 @@ class VLM_STL_Planner(Node):
         self.behav_costmap_publisher = self.create_publisher(Image, '/behav_costmap', 10)
         self.traj_image_pub = self.create_publisher(Image, '/traj_marked_image', 10)
 
-        choice = input("Publish to Robot Motors ? 1 or 0: ")
-        
-        if(int(choice) == 1):
+        if planning_config.get("publish_motors", False):
             self.pub = self.create_publisher(Twist, '/mcu/command/manual_twist', 10)
-            # self.pub = self.create_publisher(Twist, '/cmd_vel', 10)
             print("Publishing to cmd_vel")
         else:
             self.pub = self.create_publisher(Twist, "/dont_publish", 1)
@@ -312,13 +298,16 @@ class VLM_STL_Planner(Node):
         self.final_goal_pose = Pose()
 
         print("torch.cuda.is_available()",torch.cuda.is_available())
-        # Taking three float inputs from the user
         if goal_radius is None:
-            goal_radius = float(input("Enter the goal distance r (meters) : "))
+            current = np.asarray(planning_config["curr_loc"], dtype=float)
+            goal = np.asarray(planning_config["goal_loc"], dtype=float)
+            goal_radius = float(np.linalg.norm(goal - current))
         if goal_theta is None:
-            goal_theta = float(input("Enter the goal heading angle theta (degrees, left +ve) : "))
+            current = np.asarray(planning_config["curr_loc"], dtype=float)
+            goal = np.asarray(planning_config["goal_loc"], dtype=float)
+            goal_theta = float(np.degrees(np.arctan2(goal[1] - current[1], goal[0] - current[0])))
         if goal_delta is None:
-            goal_delta = float(input("Enter the goal pose angle (degrees) : "))
+            goal_delta = float(planning_config.get("goal_delta", 0.0))
         
         self.goal_radius = goal_radius
         self.goal_theta = goal_theta
@@ -358,11 +347,11 @@ class VLM_STL_Planner(Node):
         self.img_h, self.img_w = None, None
         
         # self.prompts = ["Stop_Gesture", "Pavement", "Grass"]  # Prompts for segmentation
-        self.prompts = ["Road", "Sidewalk", "Stop sign", "Building", "Grass"]
-        self.class_costs = [1, 5, 20, 20, 10]
+        self.prompts = list(perception_config["class_names"])
+        self.class_costs = list(perception_config["class_costs"])
         
         # Flag to control output publishing
-        self.publish_outputs = True
+        self.publish_outputs = bool(planning_config.get("publish_outputs", True))
         self.obstacle_dists = None
 
         #traj projection params
@@ -373,8 +362,19 @@ class VLM_STL_Planner(Node):
         # self.Projection_Matrix = [[607.175048828125, 0.0, 322.55340576171875, 0.0], [0.0, 607.222900390625, 248.86021423339844, 0.0], [0.0, 0.0, 1.0, 0.0]] # realsense lidar camera L515
         
         self.gt_depth_image = None
-        self.perception_module = PerceptionModule(self.intrinsic_matrix, self.T_cam_from_base, segmentation_classes=self.prompts, class_costs=self.class_costs,
-                                                  segmentation_model = "clipseg", planar_costmap_scale=0.1, logger=self.get_logger())
+        if offline:
+            self.perception_module = PerceptionModule.test_instance(self.prompts, self.class_costs)
+        else:
+            self.perception_module = PerceptionModule(
+                self.intrinsic_matrix,
+                self.T_cam_from_base,
+                segmentation_classes=self.prompts,
+                class_costs=self.class_costs,
+                segmentation_model=perception_config.get("segmentation_model", "clipseg"),
+                depth_model=perception_config.get("depth_model", "depth_anything"),
+                planar_costmap_scale=1,
+                logger=self.get_logger(),
+            )
         self.robot_state = RobotState() # added these integration objects
         self.route_planner = RRTPlanner()
         self.current_observation = None
@@ -649,6 +649,10 @@ class VLM_STL_Planner(Node):
             self.obstacles_odom = [transform_to_odom(self.x, self.y, self.th, x, y) for x, y in obstacles_cartesian]
         else:
             pass
+
+    def create_robot_state_observation(self):
+        self.current_observation = observation_from_perception(time.time(), self.perception_module)
+        self.robot_state.update_observation(self.current_observation)
     
     def image_callback(self, msg, save_path=None):
         try:
@@ -662,8 +666,7 @@ class VLM_STL_Planner(Node):
             else:
                 self.perception_module.process_image(cv_image)
 
-            self.current_observation = observation_from_perception(time.time(), self.perception_module)
-            self.robot_state.update_observation(self.current_observation)
+            self.create_robot_state_observation()  # Update the robot state with the new observation
 
             if self.publish_outputs:
                 image_costmap = self.perception_module.get_image_costmap().astype(np.uint8)
@@ -742,69 +745,29 @@ class VLM_STL_Planner(Node):
 
 
 if __name__ == '__main__':
-    
-    rclpy.init()
-    
     arg_parser = argparse.ArgumentParser(description='VLM-STL Planner Node')
-    arg_parser.add_argument('--synthetic-costmap', action='store_true', help='Use synthetic costmap for testing')
-    arg_parser.add_argument('--image-path', type=str, default=None, help='Path to an image file for testing')
-    arg_parser.add_argument('--save-path', type=str, default=None, help='Path to save the overlaid image')
-    arg_parser.add_argument('--curr-loc', type=float, nargs=2, default=None, help='Current location as two floats (x y)')
-    arg_parser.add_argument('--goal-loc', type=float, nargs=2, default=None, help='Goal location as two floats (x y)')
+    arg_parser.add_argument('--config', type=str, default=None, help='Path to the YAML configuration file')
     args = arg_parser.parse_args()
-    
-    
-    img_msg = None
-    
-    if args.image_path:
-        cv_image = cv2.imread(args.image_path)
-        if cv_image is None:
-            raise FileNotFoundError(f"Error: Could not read image from {args.image_path}") 
-        else:
-            img_msg = CvBridge().cv2_to_imgmsg(cv_image, encoding='rgb8')            
+    config = load_planner_config(args.config)
+    planning_config = config["planning_node"]
+    rclpy.init()
+    node = VLM_STL_Planner(config=config, offline=planning_config.get("demo_costmap", False))
 
-    goal_radius = None
-    goal_theta = None
-    goal_delta = None
-    odom = None
-
-    if args.curr_loc and args.goal_loc:
-        curr_loc = np.array(args.curr_loc)
-        goal_loc = np.array(args.goal_loc)
-        goal_radius = np.linalg.norm(goal_loc - curr_loc)
-        goal_theta = np.degrees(np.arctan2(goal_loc[1] - curr_loc[1], goal_loc[0] - curr_loc[0]))
-        goal_delta = 0.0  # Assuming the robot should face forward at the goal
-        
-        odom = Odometry()
-        odom.pose.pose.position.x = curr_loc[0]
-        odom.pose.pose.position.y = curr_loc[1]
-        odom.pose.pose.position.z = 0.0
-        quaternion = quaternion_from_euler(0, 0, 0)  # Assuming the robot is facing forward initially
-        odom.pose.pose.orientation.x = quaternion[0]
-        odom.pose.pose.orientation.y = quaternion[1]
-        odom.pose.pose.orientation.z = quaternion[2]
-        odom.pose.pose.orientation.w = quaternion[3]
-
-    node = VLM_STL_Planner(goal_radius=goal_radius, goal_theta=goal_theta, goal_delta=goal_delta)
-        
-    if img_msg is not None and not args.synthetic_costmap:
-        if args.save_path:
-            os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
-        node.image_callback(img_msg, save_path=args.save_path)      
-        
-    if odom is not None and not args.synthetic_costmap:
-        node.assignOdomCoords(odom)
-        
-        node.goal_to_odom_pose()
-        node.received_final_goal_odom = True
-        
-        node.assignOdomCoords(odom)
-        
-    if args.synthetic_costmap:
-        costmap = build_synthetic_costmap()
-        node.perception_module.assign_test_maps(costmap)
-    
     try:
+        image_path = planning_config.get("image_path")
+        save_path = planning_config.get("save_path")
+        if image_path and not planning_config.get("demo_costmap", False):
+            cv_image = cv2.imread(image_path)
+            if cv_image is None:
+                raise FileNotFoundError(f"Error: Could not read image from {image_path}")
+            img_msg = CvBridge().cv2_to_imgmsg(cv_image, encoding='rgb8')
+            if save_path:
+                output_dir = os.path.dirname(save_path)
+                if output_dir:
+                    os.makedirs(output_dir, exist_ok=True)
+            node.image_callback(img_msg, save_path=save_path)
+        if planning_config.get("demo_costmap", False):
+            node.perception_module.assign_test_maps(get_synthetic_costmap())
         node.run()
     except KeyboardInterrupt:
         pass

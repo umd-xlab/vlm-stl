@@ -11,14 +11,10 @@ import csv
 import matplotlib.pyplot as plt
 import numpy as np
 
-try:
-    from robot_state import Observation, Pose2D, RobotState
-    from rrt_planner import PlannerResult, PlannerSettings, PlannerStatus, RRTPlanner
-    from rta.preprocessing import Preprocessor
-    from rta.rta import RTA
-except ImportError:
-    from .robot_state import Observation, Pose2D, RobotState
-    from .rrt_planner import PlannerResult, PlannerSettings, PlannerStatus, RRTPlanner
+from robot_state import Observation, Pose2D, RobotState
+from rrt_planner import PlannerResult, PlannerSettings, PlannerStatus, RRTPlanner
+from rta.preprocessing import Preprocessor
+from rta.rta import RTA
 
 # rrtx.py is intentionally loaded dynamically by the planner.
 import importlib.util
@@ -32,6 +28,7 @@ _rrtx_spec.loader.exec_module(_rrtx_module)
 GridCostmap = _rrtx_module.GridCostmap
 
 
+COSTMAP_DIR = Path("sample/synthetic_costmaps")
 FRAME_ID = "map"
 POSITION_UNITS = "meters"
 TIME_UNITS = "seconds"
@@ -45,17 +42,23 @@ GOAL = (26.0, 25.0)
 GOAL_TOLERANCE_M = 0.75
 
 
-def build_synthetic_costmap() -> np.ndarray:
+
+def get_synthetic_costmap(name: str = MAP_VERSION) -> np.ndarray:
     """Return a 30 m by 30 m map with a wall requiring an end detour."""
-    costmap = np.zeros((30, 30), dtype=np.float64)
-    costmap[15, 4:27] = LETHAL_COST # this would resemble water, for example
-    costmap[8:12, 18:22] = 30.0
+    costmap_path = COSTMAP_DIR / f"{name}.npy"
+    if not costmap_path.exists():
+        raise FileNotFoundError(f"Synthetic costmap not found: {costmap_path}")
+    
+    costmap = np.load(costmap_path)
+    
+    if costmap.ndim != 2:
+        raise ValueError("Synthetic costmap must be a 2D array")
     return costmap
 
 
 def build_demo_state() -> tuple[RobotState, np.ndarray]:
     """Build the future perception-to-planner handoff using a static map."""
-    costmap = build_synthetic_costmap()
+    costmap = get_synthetic_costmap()
     observation = Observation(
         timestamp=0.0,
         top_down_costmap=costmap,
@@ -111,8 +114,64 @@ def save_top_down_plot(costmap: np.ndarray, result: PlannerResult, output_path: 
     plt.close(figure)
 
 
-def run_demo(output_dir: str | Path = "src/output") -> tuple[RobotState, PlannerResult, Path, Path]:
-    robot_state, costmap = build_demo_state()
+def run_demo(
+    output_dir: str | Path = "src/output",
+    config_path: str | Path | None = None,
+) -> tuple[RobotState, PlannerResult, Path, Path]:
+    try:
+        from planner_config import load_planner_config
+    except ImportError:
+        from .planner_config import load_planner_config
+
+    config = load_planner_config(config_path)
+    planning_config = config["planning_node"]
+    start = tuple(float(value) for value in planning_config["curr_loc"])
+    goal = tuple(float(value) for value in planning_config["goal_loc"])
+    costmap = get_synthetic_costmap()
+
+    try:
+        import rclpy
+        from nav_msgs.msg import Odometry
+        try:
+            from planning_node import VLM_STL_Planner
+        except ImportError:
+            from .planning_node import VLM_STL_Planner
+
+        if not rclpy.ok():
+            rclpy.init()
+        node = VLM_STL_Planner(config=config, offline=True)
+        try:
+            node.perception_module.assign_test_maps(costmap)
+
+            odom = Odometry()
+            odom.pose.pose.position.x = start[0]
+            odom.pose.pose.position.y = start[1]
+            odom.pose.pose.orientation.w = 1.0
+            node.assignOdomCoords(odom)
+            node.goal_to_odom_pose()
+            node.received_final_goal_odom = True
+            node.assignOdomCoords(odom)
+            node.create_robot_state_observation()
+            robot_state = node.robot_state
+        finally:
+            node.destroy_node()
+            if rclpy.ok():
+                rclpy.shutdown()
+    except ModuleNotFoundError as error:
+        if error.name != "rclpy":
+            raise
+        observation = Observation(
+            timestamp=0.0,
+            top_down_costmap=costmap,
+            class_names=list(config["perception_node"]["class_names"]),
+            metadata={"frame_id": FRAME_ID, "map_version": MAP_VERSION},
+        )
+        robot_state = RobotState(
+            current_pose=Pose2D(*start),
+            goal_pose=Pose2D(*goal),
+            current_observation=observation,
+        )
+
     settings = PlannerSettings(
         bounds=(0.0, 30.0, 0.0, 30.0),
         origin=ORIGIN,
@@ -138,12 +197,12 @@ def run_demo(output_dir: str | Path = "src/output") -> tuple[RobotState, Planner
         robot_state.update_route(result.route)
         _validate_route(result, costmap)
         route_trace = robot_state.get_current_route_trace()
-        #RTA addition
-        p = Preprocessor(route_trace, "./rta/rules.csv", "./rta/robot_states.csv")
-        p.process_dist_rule(5,20)
-        rta = RTA("./rta/feed.csv", "./rta/rules.csv", "./rta/robot_states.csv")
-        rta.start_offline()
-        
+        if Preprocessor is not None and RTA is not None:
+            p = Preprocessor(route_trace, "./rta/rules.csv", "./rta/robot_states.csv")
+            p.process_dist_rule(5, 20)
+            rta = RTA("./rta/feed.csv", "./rta/rules.csv", "./rta/robot_states.csv")
+            rta.start_offline()
+
     else:
         route_trace = None
 
@@ -162,7 +221,7 @@ def run_demo(output_dir: str | Path = "src/output") -> tuple[RobotState, Planner
     print(f"RTA handoff: robot_state.get_current_route_trace() -> waypoints={len(waypoints)}, samples={len(samples)}")
     print(f"planner status: {result.status.value} ({result.message})")
     print(f"RRT-X succeeded: {result.status == PlannerStatus.SUCCESS}; fallback used: {result.fallback_used}")
-    print(f"start: {START}; goal: {GOAL}")
+    print(f"start: {start}; goal: {goal}")
     print(f"goal reached: {result.goal_reached}; final goal error: {result.goal_error_m} m")
     print(f"path length: {None if result.route is None else result.route.distance()} m")
     print(f"planning time: {result.planning_time_s:.6f} s; random seed: {result.seed}")
@@ -170,12 +229,14 @@ def run_demo(output_dir: str | Path = "src/output") -> tuple[RobotState, Planner
     print(f"frame ID: {result.frame_id}; position units: {result.position_units}; time units: {result.time_units}")
     print(f"map version: {result.map_version}; RobotState.route identity and data consistent: {route_consistent}")
     print(f"trace artifact: {trace_path}; plot artifact: {plot_path}")
-    print(f"RTA")
-    # print("RTA evaluation not run: planner-only synthetic-map sanity check.")
-    with open("./rta/logs/failure_log.csv", "r") as f:
-        reader = csv.reader(f)
-        row_count = sum(1 for row in reader)
+    print("RTA")
+    failure_log = Path("./rta/logs/failure_log.csv")
+    if failure_log.exists():
+        with failure_log.open("r", newline="") as failure_file:
+            row_count = sum(1 for _ in csv.reader(failure_file))
         print("safe" if row_count == 1 else "violated")
+    else:
+        print("not run")
     
     return robot_state, result, trace_path, plot_path
 
