@@ -1,75 +1,61 @@
-import multiprocessing
+import threading
 import csv
 from rta.monitor import Monitor
-import multiprocessing
 
 class Booter:
-    def __init__(self, feed_path, rule_path, stop_event):
+    def __init__(self, feed, rule_path, stop_event, config):
         """
-        Called from rta.py responsible for booting up the monitors for each stl rule provided in rule_path
+        Called from rta.py responsible for starting one monitor per STL rule
         
-        feed_path - (string) file path to where the robot state data will come in
-        rule_path - (string) file path to all stl logic rules to be instantiated
-        stop_event - internal variable, used for parallel processing, passed through to all classes
-        failure_log - (string) file path where to send all stl rule violations, passed through to each monitor instance
-        data_dump_log - (string) file path to where to send all outputed robustness values for stl rules, passed through to each monitor instance
+        feed - shared in-memory feed for robot states
+        rule_path - (string) file path containing STL rules
+        stop_event - internal variable, used for threading, signal to stop running
+        config - RTAConfig containing evaluation settings
 
         """
-        self.feed_path = feed_path
+        self.feed = feed
         self.rule_path = rule_path
         self.stop_event = stop_event
-        self.failure_log = "./rta/logs/failure_log.csv"
-        self.data_dump_log = "./rta/logs/data_dump_log.csv"
-
-        self.instantiate_log_files()
-
-    def instantiate_log_files(self):
-        """
-        Instantiated Log Files with Propper Headers
-
-        'Severity' refers to "how bad" the rule was violated
-        'Robustness' refers specifically to output robustness
-
-        """
-        with open (self.failure_log, mode='w') as f:
-            writer = csv.writer(f)
-            writer.writerow(["Rule", "Time_of_Violation", "Severity"])
-        with open(self.data_dump_log, mode='w') as f:
-            writer = csv.writer(f)
-            writer.writerow(["Rule", "Time", "Robustness"])
+        self.config = config
+        self.monitors = []
 
     def start(self):
         """
-        The booter function for all individual rule monitors
-
-        Reads each rule from the rule_path file
-        Creates an instance of the monitor object and activates it
-        Waits for stop_event to be "set" at which point terminates all processes
-
+        Reads STL rules, starts their monitors in separate threads
+        and waits for completion. Propogates montior exceptions to rRTA class
         """
-        processes = []
-        
-        with open(self.rule_path, mode='r') as file:
-            csvFile = csv.reader(file)
-            next(csvFile)
-            for r in csvFile:
-                m = Monitor(self.feed_path, r, self.stop_event, self.failure_log, self.data_dump_log)
-                process = multiprocessing.Process(target=m.activate)
-                processes.append(process)
-                process.start()
+        threads = []
+        errors = []
+        error_lock = threading.Lock()
 
-        self.stop_event.wait()
-        for p in processes:
-            p.join()
+        def run_monitor(monitor):
+            try:
+                monitor.activate()
+            except BaseException as e:
+                with error_lock:
+                    errors.append(e)
 
-    
-if __name__ == '__main__':
-    """
-    Sample setup to be run with 'python monitor.py' from terminal
+                self.stop_event.set()
+                self.feed.finish()
 
-    """
-    stop_event = multiprocessing.Event()
-    b = Booter('feed.csv', 'rules.csv', stop_event)
-    b.start()
-    time.sleep(15)
-    stop_event.set()
+        try:
+            with open(self.rule_path, mode='r') as file:
+                csvFile = csv.reader(file)
+                next(csvFile)
+
+                for rule in csvFile:
+                    if self.stop_event.is_set():
+                        break
+                    monitor = Monitor(self.feed, rule, self.stop_event)
+                    self.monitors.append(monitor)
+                    thread = threading.Thread(target=run_monitor, args=(monitor,))
+                    threads.append(thread)
+                    thread.start()
+        finally:
+            if self.stop_event.is_set():
+                self.feed.finish()
+            for thread in threads:
+                thread.join()
+
+        if errors:
+            raise RuntimeError("One or more STL monitors failed") from errors[0]
