@@ -50,6 +50,19 @@ except ImportError:
 
 import argparse
 
+
+class ControlLawSettings:
+    # (self, K1=1.2, K2=1, BETA=0.4, LAMBDA=2, V_MAX=0.8, V_MIN=0.0, R_THRESH=0.05):
+    def __init__(self, K1=1, K2=3, BETA=1, LAMBDA=1, V_MAX=1.0, V_MIN=0.0, R_THRESH=0.05):
+        self.m_K1 = K1
+        self.m_K2 = K2
+        self.m_BETA = BETA
+        self.m_LAMBDA = LAMBDA
+        self.m_V_MAX = V_MAX
+        self.m_V_MIN = V_MIN
+        self.m_R_THRESH = R_THRESH
+
+
 class ControlLaw:
     def __init__(self, settings=ControlLawSettings()):
         self.settings = settings
