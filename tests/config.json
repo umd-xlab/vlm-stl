@@ -2,6 +2,6 @@
   "config_description": "Offline STL route evaluation",
   "offline_mode": true,
   "enable_logging": true,
-  "stl_rule_file": "/mnt/d/Users/Matthew/rta/rules.csv",
-  "logging_output_folder": "/mnt/d/Users/Matthew/rta/logs"
+  "stl_rule_file": "src/rta/rules_edited.csv",
+  "logging_output_folder": "src/rta/logs"
 }
