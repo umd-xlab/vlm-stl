@@ -16,6 +16,14 @@ def test_demo_stores_route_and_writes_trace_and_plot(tmp_path):
     # Check if the current route was set to the resulting route
     assert state.current_route is result.route
 
+    assert state.current_pose is not None
+    assert state.current_pose.as_point() == (2.5, 5.0)
+    assert state.goal_pose is not None
+    assert state.goal_pose.as_point() == (25.0, 25.0)
+    assert state.current_observation is not None
+    assert state.current_observation.top_down_costmap is not None
+    assert state.current_observation.top_down_costmap.shape == (30, 30)
+
     # Check if the route contains waypoints
     assert result.route.waypoints
 
