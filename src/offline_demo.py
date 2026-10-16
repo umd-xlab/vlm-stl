@@ -11,10 +11,15 @@ import csv
 import matplotlib.pyplot as plt
 import numpy as np
 
-from robot_state import Observation, Pose2D, RobotState
-from rrt_planner import PlannerResult, PlannerSettings, PlannerStatus, RRTPlanner
-from rta.preprocessing import Preprocessor
-from rta.rta import RTA
+try:
+    from robot_state import Observation, Pose2D, RobotState
+    from rrt_planner import PlannerResult, PlannerSettings, PlannerStatus, RRTPlanner
+    from rta.config import RTAConfig
+    from rta.preprocessor import Preprocessor
+    from rta.rta import RTA
+except ImportError:
+    from .robot_state import Observation, Pose2D, RobotState
+    from .rrt_planner import PlannerResult, PlannerSettings, PlannerStatus, RRTPlanner
 
 # rrtx.py is intentionally loaded dynamically by the planner.
 import importlib.util
@@ -197,12 +202,19 @@ def run_demo(
         robot_state.update_route(result.route)
         _validate_route(result, costmap)
         route_trace = robot_state.get_current_route_trace()
-        if Preprocessor is not None and RTA is not None:
-            p = Preprocessor(route_trace, "./rta/rules.csv", "./rta/robot_states.csv")
-            p.process_dist_rule(5, 20)
-            rta = RTA("./rta/feed.csv", "./rta/rules.csv", "./rta/robot_states.csv")
+        #RTA
+        PROJECT_ROOT = Path(__file__).resolve().parent.parent
+        CONFIG_PATH = PROJECT_ROOT / "tests" / "config.json"
+        config = RTAConfig.from_json(CONFIG_PATH)
+        p = Preprocessor(route_trace, config.stl_rule_file)
+        state_data = p.process_dist_rule(10.1,18.9)
+        rta = RTA(config, state_data)
+        if config.offline_mode:
             rta.start_offline()
+        failures = rta.get_failures()
+        print(f"failures: {failures}")
 
+        
     else:
         route_trace = None
 
@@ -229,14 +241,6 @@ def run_demo(
     print(f"frame ID: {result.frame_id}; position units: {result.position_units}; time units: {result.time_units}")
     print(f"map version: {result.map_version}; RobotState.route identity and data consistent: {route_consistent}")
     print(f"trace artifact: {trace_path}; plot artifact: {plot_path}")
-    print("RTA")
-    failure_log = Path("./rta/logs/failure_log.csv")
-    if failure_log.exists():
-        with failure_log.open("r", newline="") as failure_file:
-            row_count = sum(1 for _ in csv.reader(failure_file))
-        print("safe" if row_count == 1 else "violated")
-    else:
-        print("not run")
     
     return robot_state, result, trace_path, plot_path
 
