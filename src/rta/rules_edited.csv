@@ -1,0 +1,2 @@
+rule,input,output
+out = (dst > 5),,dst
