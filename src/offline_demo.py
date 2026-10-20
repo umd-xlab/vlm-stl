@@ -145,6 +145,7 @@ def run_demo(
         if not rclpy.ok():
             rclpy.init()
         node = VLM_STL_Planner(config=config, offline=True)
+        print(f"Running offline demo with start={start}, goal={goal}, costmap shape={costmap.shape}")
         try:
             node.perception_module.assign_test_maps(costmap)
 
@@ -162,6 +163,8 @@ def run_demo(
             node.destroy_node()
             if rclpy.ok():
                 rclpy.shutdown()
+                
+        print(f"RobotState built successfully")
     except ModuleNotFoundError as error:
         if error.name != "rclpy":
             raise

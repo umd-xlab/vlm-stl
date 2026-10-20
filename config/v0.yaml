@@ -1,13 +1,18 @@
-planning_node:
-  curr_loc: [3.0, 5.0]
-  goal_loc: [26.0, 25.0]
+planning_node: 
+  demo_costmap: true
+  image_path: null
+  save_path: null
+  curr_loc : [2.5, 5.0]
+  goal_loc : [25.0, 25.0]
+
+  publish_outputs: false
+  publish_motors: false
+  frame_id: "map"
+  map_version: "synthetic-detour-v1"
 
 perception_node:
-  class_names:
-    - Road
-    - Sidewalk
-    - Tree
-    - Building
-    - Grass
+  class_names: ["synthetic_traversable", "synthetic_untraversable"]
+  class_costs: [1, 20]
 
-  class_costs: [1, 5, 20, 20, 10]
+  segmentation_model: "clipseg"
+  depth_model: "moge"
