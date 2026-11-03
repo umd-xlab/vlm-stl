@@ -1,13 +1,13 @@
 huggingface-hub
 matplotlib
-numpy
+numpy==1.26.4
 openai
 opencv-contrib-python
 opencv-python
 pillow
 safetensors
 scikit-image
-scipy
+scipy==1.13.1
 tokenizers
 torch
 torchaudio
@@ -21,3 +21,7 @@ watchdog
 rtamt @ git+https://github.com/RoboticsMB/rtamt.git@master
 pyyaml
 moge @ git+https://github.com/microsoft/MoGe.git@286873bdaa16fe05086ac2e081d6bc87b7523118
+pandas==2.2.3
+countourpy==1.3.1
+plyfile==1.1
+tiffile=2024.9.20
