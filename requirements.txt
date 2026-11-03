@@ -18,6 +18,6 @@ pathvalidate
 transformers==4.57.0
 google-genai
 watchdog
-rtamt
+rtamt @ git+https://github.com/RoboticsMB/rtamt.git@master
 pyyaml
 moge @ git+https://github.com/microsoft/MoGe.git@286873bdaa16fe05086ac2e081d6bc87b7523118
