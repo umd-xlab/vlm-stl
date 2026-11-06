@@ -1,0 +1,18 @@
+planning_node: 
+  demo_costmap: true
+  image_path: null
+  save_path: null
+  curr_loc : [2.5, 5.0]
+  goal_loc : [25.0, 25.0]
+
+  publish_outputs: false
+  publish_motors: false
+  frame_id: "map"
+  map_version: "synthetic-detour-v1"
+
+perception_node:
+  class_names: ["Road", "Sidewalk", "Stop sign", "Building", "Grass"]
+  class_costs: [1, 5, 20, 20, 10]
+
+  segmentation_model: "clipseg"
+  depth_model: "moge"
