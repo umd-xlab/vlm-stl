@@ -15,7 +15,7 @@ try:
     from robot_state import Observation, Pose2D, RobotState
     from rrt_planner import PlannerResult, PlannerSettings, PlannerStatus, RRTPlanner
     from rta.config import RTAConfig
-    from rta.preprocessor import Preprocessor
+    from rta.signal_generator import SignalGenerator
     from rta.rta import RTA
 except ImportError:
     from .robot_state import Observation, Pose2D, RobotState
@@ -90,6 +90,16 @@ def _validate_route(result: PlannerResult, costmap: np.ndarray) -> None:
         if not grid.is_collision_free(start, end, resolution=0.1):
             raise ValueError(f"Route segment is not collision-free: {start} -> {end}")
 
+def _run_rta(route_trace, perception, grid_costmap, obj_hardx, obj_hardy):
+    CONFIG_PATH = Path(__file__).resolve().parent.parent / "tests" / "config.json"
+    config = RTAConfig.from_json(CONFIG_PATH)
+    p = SignalGenerator(route_trace, config.stl_rule_file, perception, grid_costmap, obj_hardx, obj_hardy)
+    state_data = p.generate_signals()
+    # state_data.to_csv("src/output/state_data.csv")
+    rta = RTA(config, state_data)
+    if config.offline_mode:
+        rta.start_offline()
+    return rta.get_failures()
 
 def save_top_down_plot(costmap: np.ndarray, result: PlannerResult, output_path: Path) -> None:
     figure, axis = plt.subplots(figsize=(7, 7))
@@ -201,25 +211,35 @@ def run_demo(
         map_version=MAP_VERSION,
         goal_tolerance_m=GOAL_TOLERANCE_M,
     )
-    if result.route is not None:
+
+    MAX_REPAIRS = 1
+    route_trace = None
+    for _ in range(MAX_REPAIRS):
+        if result.route is None:
+            print("No Route to Process")
+            break
+
         robot_state.update_route(result.route)
         _validate_route(result, costmap)
         route_trace = robot_state.get_current_route_trace()
-        #RTA
-        PROJECT_ROOT = Path(__file__).resolve().parent.parent
-        CONFIG_PATH = PROJECT_ROOT / "tests" / "config.json"
-        config = RTAConfig.from_json(CONFIG_PATH)
-        p = Preprocessor(route_trace, config.stl_rule_file)
-        state_data = p.process_dist_rule(10.1,18.9)
-        rta = RTA(config, state_data)
-        if config.offline_mode:
-            rta.start_offline()
-        failures = rta.get_failures()
-        print(f"failures: {failures}")
 
-        
-    else:
-        route_trace = None
+        #TODO MAKE SURE THE COSTMAP IS UPDATED BEFORE PASSING THROUGH AGAIN
+        grid = GridCostmap(costmap, origin=ORIGIN, resolution=RESOLUTION_M, lethal_cost=LETHAL_COST) #Currently recreating it every time, move to top
+        failures = _run_rta(route_trace, node.perception_module, grid, obj_hardx=10.1, obj_hardy=18.9)
+        if not failures:
+            print("RTA Passed")
+            break
+
+        print(failures)
+
+        #Convert Failure Indices into map feedback
+        indices = [f['waypoint_index'] for f in failures]
+        failed_points = [route_trace["waypoints"][i] if i != None else 0 for i in indices]
+
+        #TODO: Kristy it seems like the tree stuff would go here?
+        #Repair Tree And Recreate Route
+        #Something with RRTXPlanner.update_environment()? (from rrtx.py)
+        #RRTPlanner can do a build_costmap with extra values?
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)

@@ -1,2 +1,4 @@
 rule,input,output
 out = (dst > 5),,dst
+out = ((srf < 0) implies eventually[0:5] (srf > 0)),,srf
+out = (dnr > 2),,dnr

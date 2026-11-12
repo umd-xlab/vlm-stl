@@ -111,6 +111,22 @@ class GridCostmap:
             return None
         return y, x
 
+    def grid_to_world(self, cell: tuple[int, int]) -> Point | None:
+        """Convers a grid index to a world point
+
+        Inputs:
+            (row, col) if the point is inside the map
+        Returns:
+            point: 2D world coordinate, otherwise None
+        """
+        row,col = cell
+        if col < 0 or row < 0 or col >= self.width or row >= self.height:
+            return None
+
+        x = (col + 0.5) * self.resolution + self.origin[0] #Returning the middle
+        y = (row + 0.5) * self.resolution + self.origin[1] #Returning the middle
+        return (x,y)
+
     def cost_at(self, point: Point) -> float:
         """Return the map cost at a world point.
 
