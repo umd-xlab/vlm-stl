@@ -390,6 +390,7 @@ class VLM_STL_Planner(Node):
             )
         self.robot_state = RobotState() # added these integration objects
         self.route_planner = RRTPlanner()
+        self.active_route = None  # Controller route belongs to this coordinator.
         self.current_observation = None
         self.rta_feed_path = "feed.csv" #this is what I'm assuming will be fed into the rta
         self.last_plan_time = 0.0
@@ -448,11 +449,11 @@ class VLM_STL_Planner(Node):
 
     def update_route_plan(self):
         now = time.time()
-        if self.robot_state.current_route is not None and now - self.last_plan_time < self.plan_period:
+        if self.active_route is not None and now - self.last_plan_time < self.plan_period:
             return
         try:
             route = self.route_planner.plan(self.robot_state, self.current_observation)
-            self.robot_state.update_route(route)
+            self.active_route = route
             self.last_plan_time = now
         except ValueError as e:
             self.get_logger().warn(f"Skipping route plan: {str(e)}")
@@ -460,7 +461,7 @@ class VLM_STL_Planner(Node):
             self.get_logger().error(f"Route planning failed: {str(e)}")
 
     def update_velocity_from_route(self):
-        route = self.robot_state.current_route
+        route = self.active_route
         if route is None or route.is_empty:
             self.speed.linear.x = 0.0
             self.speed.angular.z = 0.0

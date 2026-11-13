@@ -12,7 +12,7 @@ class SignalGenerator:
         Saves Modules/Parameters to use
         
         :param self: Signal Generator instance
-        :param robot_trace: route trace from robot_state.get_current_route_trace()
+        :param robot_trace: validated planner route trace from Route.to_trace()
         :param rule_path: path to STL rules CSV file
         :param perception: Perception Module instance
         :param grid_costmap: grid_costmap instance for coordinate conversion

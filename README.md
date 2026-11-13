@@ -20,7 +20,7 @@ We're excited to announce **V0**, the first release of our offline planning pipe
 - **Offline Route Planning:** Uses an RRT-X-based planner to generate collision-free routes between a start and goal on a synthetic costmap.
 - **Robot State Integration:** Connects the robot's current pose, goal pose, and map observation to the planning pipeline.
 - **Route Validation:** Checks that planned waypoints remain within map bounds and that route segments are collision-free.
-- **Runtime Assurance (RTA):** Passes the planned route trace to the RTA module for offline evaluation and failure detection.
+- **Runtime Assurance (RTA):** The offline coordinator passes the planner output directly to RTA using `result.route.to_trace()` for evaluation and failure detection. `RobotState` stores observations and robot state, with no planned routes. The ROS planning node retains its controller route locally; online RTA evaluation remains unimplemented.
 - **Visualization & Logging:** Generates a top-down route plot and a JSON trace containing route waypoints and trajectory samples.
 
 V0 provides an initial sanity check of the planning pipeline in a controlled, reproducible environment, without requiring live robot operation.

@@ -9,7 +9,7 @@ know how RRT-X is loaded, how costmaps are adapted, or whether a fallback was
 used.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 import time
 import importlib.util
@@ -21,12 +21,158 @@ from typing import Any
 import numpy as np
 
 try:
-    from robot_state import Observation, Pose2D, RobotState, Route, route_from_waypoints
+    from robot_state import Observation, Pose2D, RobotState
 except ImportError:
-    from .robot_state import Observation, Pose2D, RobotState, Route, route_from_waypoints
+    from .robot_state import Observation, Pose2D, RobotState
 
 
 Point = tuple[float, float]
+Waypoint = Point
+
+
+@dataclass
+class Route:
+    """Candidate or accepted robot route.
+
+    Inputs:
+        waypoints: Ordered 2D waypoints, usually from the planner.
+        trajectory: Optional time/state-expanded route as poses.
+        costs: Named cost components used to compare routes.
+        generated_at: Wall-clock time when this route was produced.
+        metadata: Extra route/planner data that does not fit fixed fields.
+    """
+
+    waypoints: list[Waypoint] = field(default_factory=list)
+    # Geometry poses mirror waypoints; nominal-speed timing lives in metadata["samples"].
+    trajectory: list[Pose2D] = field(default_factory=list)
+    costs: dict[str, float] = field(default_factory=dict)
+    generated_at: float = field(default_factory=time.time)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def is_empty(self) -> bool:
+        """Check whether route has no usable geometry.
+
+        Returns:
+            True if both waypoints and trajectory are empty.
+        """
+        return not self.waypoints and not self.trajectory
+
+    def first_waypoint(self) -> Waypoint | None:
+        """Return the next waypoint for a controller.
+
+        Returns:
+            First waypoint, or None if no waypoint exists.
+        """
+        return self.waypoints[0] if self.waypoints else None
+
+    def distance(self) -> float:
+        """Compute total route length.
+
+        Returns:
+            Sum of straight-line distances between consecutive route points.
+        """
+        points: list[Point]
+        if self.trajectory:
+            points = [pose.as_point() for pose in self.trajectory]
+        else:
+            points = list(self.waypoints)
+        if len(points) < 2:
+            return 0.0
+        return sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(points[:-1], points[1:]))
+
+    def estimated_duration(self, nominal_speed: float) -> float:
+        """Estimate traversal time for the route.
+
+        Inputs:
+            nominal_speed: Assumed positive translational speed.
+        Returns:
+            Route length divided by nominal_speed, or infinity if speed is invalid.
+        """
+        if nominal_speed <= 0.0:
+            return math.inf
+        return self.distance() / nominal_speed
+
+    def to_trace(self) -> dict[str, Any]:
+        """Return the validated, JSON-compatible route handoff for RTA."""
+        route = self
+        metadata = route.metadata
+        if len(route.waypoints) != len(route.trajectory):
+            raise ValueError("route waypoints and trajectory lengths must match")
+
+        waypoints = []
+        for index, (waypoint, pose) in enumerate(zip(route.waypoints, route.trajectory)):
+            if len(waypoint) != 2 or not all(math.isfinite(float(value)) for value in waypoint):
+                raise ValueError(f"route waypoint {index} must be a finite 2D point")
+            if not all(math.isfinite(float(value)) for value in (pose.x, pose.y, pose.theta)):
+                raise ValueError(f"route trajectory pose {index} must be finite")
+            if not math.isclose(float(waypoint[0]), float(pose.x)) or not math.isclose(float(waypoint[1]), float(pose.y)):
+                raise ValueError(f"route trajectory pose {index} does not match its waypoint")
+            waypoints.append({"x": float(waypoint[0]), "y": float(waypoint[1])})
+
+        raw_samples = metadata.get("samples")
+        if raw_samples is None:
+            raise ValueError("route metadata must contain timed samples")
+        if len(raw_samples) != len(waypoints):
+            raise ValueError("route timed samples and waypoints lengths must match")
+
+        samples = []
+        previous_time = None
+        for index, (sample, waypoint) in enumerate(zip(raw_samples, waypoints)):
+            try:
+                x = float(sample["x"])
+                y = float(sample["y"])
+                time_s = float(sample["time"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError(f"route sample {index} is missing x, y, or time") from error
+            if not all(math.isfinite(value) for value in (x, y, time_s)):
+                raise ValueError(f"route sample {index} must contain finite values")
+            if previous_time is not None and time_s <= previous_time:
+                raise ValueError("route sample timestamps must be strictly increasing")
+            if not math.isclose(x, waypoint["x"]) or not math.isclose(y, waypoint["y"]):
+                raise ValueError(f"route sample {index} does not match its waypoint")
+            if samples and x == samples[-1]["x"] and y == samples[-1]["y"]:
+                raise ValueError("route contains adjacent duplicate timed samples without a dwell event")
+            samples.append({"waypoint_index": index, "x": x, "y": y, "time_s": time_s})
+            previous_time = time_s
+
+        origin = metadata.get("origin_m")
+        if origin is not None:
+            if len(origin) != 2 or not all(math.isfinite(float(value)) for value in origin):
+                raise ValueError("route origin_m must be a finite 2D point")
+            origin = [float(value) for value in origin]
+
+        trace = {
+            "frame_id": metadata.get("frame_id"),
+            "position_units": metadata.get("position_units"),
+            "time_units": metadata.get("time_units"),
+            "map_version": metadata.get("map_version"),
+            "origin_m": origin,
+            "resolution_m": metadata.get("resolution_m"),
+            "lethal_cost": metadata.get("lethal_cost"),
+            "waypoints": waypoints,
+            "trajectory_samples": samples,
+        }
+        for key in ("resolution_m", "lethal_cost"):
+            if trace[key] is not None:
+                value = float(trace[key])
+                if not math.isfinite(value):
+                    raise ValueError(f"route {key} must be finite")
+                trace[key] = value
+        return trace
+
+
+def route_from_waypoints(waypoints: list[Waypoint] | np.ndarray, costs: dict[str, float] | None = None) -> Route:
+    """Create a Route object from planner waypoints.
+
+    Inputs:
+        waypoints: Iterable/array of points shaped like [(x, y), ...].
+        costs: Optional named planner cost components.
+    Returns:
+        Route with normalized float waypoints.
+    """
+    waypoint_list = [(float(point[0]), float(point[1])) for point in waypoints]
+    return Route(waypoints=waypoint_list, costs=costs or {})
 
 
 @dataclass
@@ -94,6 +240,25 @@ class PlannerResult:
     resolution_m: float
     lethal_cost: float
     fallback_used: bool = False
+
+
+# Switching planners:
+# - Route, Route.to_trace(), and PlannerResult are the output contract shared with
+#   the coordinators. Keep their geometry, timed samples, frame/units, map metadata,
+#   and waypoint indices consistent so RTA and control do not need to change.
+# - Replace _load_rrtx() and _plan_with_rrtx_result() with the new backend's loader
+#   and invocation; adapt PlannerSettings to its configuration and map its outcomes
+#   to PlannerStatus. Preserve explicit failure/fallback reporting.
+# - In plan_result(), normalize the backend output into start-to-goal waypoints,
+#   trajectory poses, costs, and metadata; update the backend name as well. If it
+#   supplies native timing, replace _trajectory_samples()'s nominal-speed estimate
+#   while retaining the trace schema and strictly increasing relative seconds.
+# - Adapt _build_costmap() if the backend needs another map representation; keep
+#   world coordinates, origin, resolution, and collision semantics consistent.
+# - If renaming/replacing this adapter, update its imports and construction in
+#   planning_node.py, offline_demo.py, and planner tests. The demo also imports
+#   RRT-X's GridCostmap directly for validation/RTA; review that dependency too.
+#   RobotState should continue to hold observations/state, never planned routes.
 
 
 class RRTPlanner:

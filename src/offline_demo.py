@@ -219,9 +219,8 @@ def run_demo(
             print("No Route to Process")
             break
 
-        robot_state.update_route(result.route)
         _validate_route(result, costmap)
-        route_trace = robot_state.get_current_route_trace()
+        route_trace = result.route.to_trace()
 
         #TODO MAKE SURE THE COSTMAP IS UPDATED BEFORE PASSING THROUGH AGAIN
         grid = GridCostmap(costmap, origin=ORIGIN, resolution=RESOLUTION_M, lethal_cost=LETHAL_COST) #Currently recreating it every time, move to top
@@ -246,14 +245,13 @@ def run_demo(
     trace_path = output_path / "offline_demo_trace.json"
     plot_path = output_path / "offline_demo_top_down.png"
     if route_trace is None:
-        raise RuntimeError("successful offline demo requires a current route trace")
+        raise RuntimeError("successful offline demo requires a planned route trace")
     trace_path.write_text(json.dumps(route_trace, indent=2) + "\n")
     save_top_down_plot(costmap, result, plot_path)
 
-    route_consistent = result.route is not None and robot_state.current_route is result.route
     waypoints = route_trace["waypoints"]
     samples = route_trace["trajectory_samples"]
-    print(f"RTA handoff: robot_state.get_current_route_trace() -> waypoints={len(waypoints)}, samples={len(samples)}")
+    print(f"RTA handoff: result.route.to_trace() -> waypoints={len(waypoints)}, samples={len(samples)}")
     print(f"planner status: {result.status.value} ({result.message})")
     print(f"RRT-X succeeded: {result.status == PlannerStatus.SUCCESS}; fallback used: {result.fallback_used}")
     print(f"start: {start}; goal: {goal}")
@@ -262,7 +260,7 @@ def run_demo(
     print(f"planning time: {result.planning_time_s:.6f} s; random seed: {result.seed}")
     print(f"map origin: {result.origin}; resolution: {result.resolution_m} m/cell; lethal cost: {result.lethal_cost}")
     print(f"frame ID: {result.frame_id}; position units: {result.position_units}; time units: {result.time_units}")
-    print(f"map version: {result.map_version}; RobotState.route identity and data consistent: {route_consistent}")
+    print(f"map version: {result.map_version}")
     print(f"trace artifact: {trace_path}; plot artifact: {plot_path}")
     
     return robot_state, result, trace_path, plot_path

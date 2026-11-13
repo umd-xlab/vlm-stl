@@ -4,17 +4,17 @@ from src.offline_demo import run_demo
 from src.rrt_planner import PlannerStatus
 
 
-def test_demo_stores_route_and_writes_trace_and_plot(tmp_path):
+def test_demo_keeps_route_out_of_state_and_writes_trace_and_plot(tmp_path):
     state, result, trace_path, plot_path = run_demo(tmp_path)
 
-    # Check if the planner succeeded and the route is stored in the RobotState
+    # The planner output belongs to the coordinator, separate from robot state.
     assert result.status is PlannerStatus.SUCCESS
 
     # Check if the resulting route exists
     assert result.route is not None
 
-    # Check if the current route was set to the resulting route
-    assert state.current_route is result.route
+    assert not hasattr(state, "current_route")
+    assert "current_route" not in state.snapshot()
 
     assert state.current_pose is not None
     assert state.current_pose.as_point() == (2.5, 5.0)
@@ -35,6 +35,7 @@ def test_demo_stores_route_and_writes_trace_and_plot(tmp_path):
     assert plot_path.exists() and plot_path.stat().st_size > 0
 
     trace = json.loads(trace_path.read_text())
+    assert trace == result.route.to_trace()
     assert trace["frame_id"] == "map"
     assert trace["position_units"] == "meters"
     assert trace["time_units"] == "seconds"
