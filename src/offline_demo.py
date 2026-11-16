@@ -142,6 +142,7 @@ def run_demo(
     planning_config = config["planning_node"]
     start = tuple(float(value) for value in planning_config["curr_loc"])
     goal = tuple(float(value) for value in planning_config["goal_loc"])
+    costs = config['perception_node']['class_costs']
     costmap = get_synthetic_costmap()
 
     try:
@@ -157,7 +158,7 @@ def run_demo(
         node = VLM_STL_Planner(config=config, offline=True)
         print(f"Running offline demo with start={start}, goal={goal}, costmap shape={costmap.shape}")
         try:
-            node.perception_module.assign_test_maps(costmap)
+            node.perception_module.assign_test_maps(costmap, costs)
 
             odom = Odometry()
             odom.pose.pose.position.x = start[0]

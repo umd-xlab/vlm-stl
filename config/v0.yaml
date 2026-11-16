@@ -11,8 +11,8 @@ planning_node:
   map_version: "synthetic-detour-v1"
 
 perception_node:
-  class_names: ["synthetic_traversable", "synthetic_untraversable"]
-  class_costs: [1, 20]
+  class_names: ["synthetic_traversable", "synthetic_obstacle", "synthetic_untraversable"]
+  class_costs: [1, 30, 255]
 
   segmentation_model: "clipseg"
   depth_model: "moge"
