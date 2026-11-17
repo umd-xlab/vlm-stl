@@ -90,7 +90,7 @@ def _validate_route(result: PlannerResult, costmap: np.ndarray) -> None:
         if not grid.is_collision_free(start, end, resolution=0.1):
             raise ValueError(f"Route segment is not collision-free: {start} -> {end}")
 
-def _run_rta(route_trace, perception, grid_costmap, obj_hardx, obj_hardy):
+def _run_rta(route_trace, perception, grid_costmap, obj_hardx=None, obj_hardy=None):
     CONFIG_PATH = Path(__file__).resolve().parent.parent / "tests" / "config.json"
     config = RTAConfig.from_json(CONFIG_PATH)
     p = SignalGenerator(route_trace, config.stl_rule_file, perception, grid_costmap, obj_hardx, obj_hardy)
@@ -225,7 +225,8 @@ def run_demo(
 
         #TODO MAKE SURE THE COSTMAP IS UPDATED BEFORE PASSING THROUGH AGAIN
         grid = GridCostmap(costmap, origin=ORIGIN, resolution=RESOLUTION_M, lethal_cost=LETHAL_COST) #Currently recreating it every time, move to top
-        failures = _run_rta(route_trace, node.perception_module, grid, obj_hardx=10.1, obj_hardy=18.9)
+        # failures = _run_rta(route_trace, node.perception_module, grid, obj_hardx=10.1, obj_hardy=18.9)
+        failures = _run_rta(route_trace, node.perception_module, grid)
         if not failures:
             print("RTA Passed")
             break
