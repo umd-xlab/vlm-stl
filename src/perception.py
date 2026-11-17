@@ -533,7 +533,7 @@ class PerceptionModule:
             for i, cost in enumerate(class_costs):
                 self.ground_plane_env_state_map[i + 1, :, :] = (costmap == cost).astype(np.int8)
                 
-            self.ground_plane_env_state_map[0, :, :] = (costmap == 0).astype(np.int8)  # Background class for non-segmented areas
+            self.ground_plane_env_state_map[0, :, :] = (np.sum(self.ground_plane_env_state_map[1:], axis=0) == 0).astype(np.int8)  # Background class for non-segmented areas
             
         self.environment_state = self.ground_plane_env_state_map.copy()
         self.image_costmap = costmap.copy()

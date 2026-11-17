@@ -12,7 +12,7 @@ planning_node:
 
 perception_node:
   class_names: ["synthetic_traversable", "synthetic_obstacle", "synthetic_untraversable"]
-  class_costs: [1, 30, 255]
+  class_costs: [0, 30, 255]
 
   segmentation_model: "clipseg"
   depth_model: "moge"
