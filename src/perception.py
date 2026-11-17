@@ -516,7 +516,7 @@ class PerceptionModule:
 
         return marked_img, max_cost, total_cost, points
     
-    def assign_test_maps(self, costmap, env_state_map=None):
+    def assign_test_maps(self, costmap, class_costs, env_state_map=None):
         """
         Assigns a test costmap to the perception module for testing purposes.
         """
@@ -528,13 +528,16 @@ class PerceptionModule:
         self.ground_plane_cost_map = costmap.copy()
         if env_state_map is not None:
             self.ground_plane_env_state_map = env_state_map.copy()
+        else:
+            self.ground_plane_env_state_map = np.zeros((len(self.prompts) + 1, env_h, env_w), dtype=np.int8)
+            for i, cost in enumerate(class_costs):
+                self.ground_plane_env_state_map[i + 1, :, :] = (costmap == cost).astype(np.int8)
+                
+            self.ground_plane_env_state_map[0, :, :] = (np.sum(self.ground_plane_env_state_map[1:], axis=0) == 0).astype(np.int8)  # Background class for non-segmented areas
+            
+        self.environment_state = self.ground_plane_env_state_map.copy()
         self.image_costmap = costmap.copy()
         self.point_cloud = np.zeros((env_h, env_w, 3))  # Dummy point cloud for testing
-        if env_state_map is None:
-            self.environment_state = np.zeros((env_h, env_w, len(self.prompts) + 1), dtype=np.int8)
-            self.environment_state[:, :, 0] = 1
-        else:
-            self.environment_state = np.asarray(env_state_map).copy()
         self.new_costmap = False  # did not get this cost map from an images
 
 def single_image_test(intrinsic_matrix, T_base_from_cam, dist, image_path, 

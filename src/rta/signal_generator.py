@@ -76,6 +76,7 @@ class SignalGenerator:
         trajectory = self.robot_trace["trajectory_samples"]
         required_signals = self.get_required_signals()
 
+        #Hard coded object rule: out = (dst > 5),,dst
         if "dst" in required_signals:
             if self.obj_hardx is None or self.obj_hardy is None:
                 raise ValueError("Hard coded object position is missing for dst rule")
@@ -163,7 +164,8 @@ class SignalGenerator:
             return -1.0
 
         class_name = self.perception.prompts[class_idx - 1]
-        if class_name == "Sidewalk":
+        # if class_name == "Sidewalk": #NOTE TURNED OFF BECAUSE DEMO CLASSES ARE: ["synthetic_traversable", "synthetic_obstacle", "synthetic_untraversable"]
+        if class_name == "synthetic_traversable":
             return 1.0
 
         return -1.0
@@ -207,28 +209,18 @@ class SignalGenerator:
             x,y coordinates of all obstacles
         """
 
-        # print(f"Environment map shape: {self.environment_map.shape}")
-        # print(f"Planner costmap shape: {self.grid_costmap.costmap.shape}")
-        # print(f"Perception classes: {self.perception.prompts}")
-
-        #Currently b/c of demo its ["synthetic_traversable", "synthetic_obstacle"]
-        #And my environment map shape is (3,1,1) when it should be (3,30,30) I think
-
-
+        #Currently b/c of demo environment map classes are ["synthetic_traversable", "synthetic_obstacle", "synthetic_untraversable"]]
         class_map = np.argmax(self.environment_map, axis=0)
 
         obstacle_classes = [0] #0 is the unkown channel
 
         for idx, class_name in enumerate(self.perception.prompts):
-            if class_name in ["Tree", "Building"]:
+            # if class_name in ["Tree", "Building"]: #NOTE TURNED OFF BECAUSE DEMO CLASSES ARE: ["synthetic_traversable", "synthetic_obstacle", "synthetic_untraversable"]
+            if class_name in ["synthetic_obstacle", "synthetic_untraversable"]:
                 obstacle_classes.append(idx+1)
 
         obstacle_mask = np.isin(class_map, obstacle_classes) #True if obstacle
         obstacle_rows, obstacle_columns = np.where(obstacle_mask)
-
-        # print("HERE")
-        # print(obstacle_mask)
-        # print("")
 
         obstacle_points = []
 
